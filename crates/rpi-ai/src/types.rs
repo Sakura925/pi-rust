@@ -506,6 +506,12 @@ pub struct ThinkingBudgets {
     pub medium: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high: Option<u64>,
+    /// Budgets for xhigh/max; fall back to `high` when unset, keeping the
+    /// pre-0.3.23 behavior (all three mapped to the high budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhigh: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
 }
 
 // ----------------------------------------------------------------------------

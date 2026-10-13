@@ -950,6 +950,15 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
                 }
             }
         }
+        if matches!(api, Api::AnthropicMessages) {
+            // Mirror the openai arm: honor `compat` on anthropic-messages
+            // models.json definitions too (e.g. `forceAdaptiveThinking`).
+            if let Some(value) = def.compat.clone() {
+                if let Ok(compat) = serde_json::from_value(value) {
+                    m.compat = Some(StreamingProtocolCompat::AnthropicMessages(compat));
+                }
+            }
+        }
         if !headers.is_empty() {
             m.headers = Some(headers);
         }

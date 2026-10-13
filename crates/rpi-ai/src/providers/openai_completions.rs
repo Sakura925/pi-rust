@@ -387,8 +387,8 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
         body.insert("temperature".into(), Value::from(temperature));
     }
     if model.reasoning && supports_reasoning_effort(model) {
-        if let Some(effort) = reasoning_effort(opts.reasoning_level()) {
-            body.insert("reasoning_effort".into(), Value::String(effort.into()));
+        if let Some(effort) = mapped_reasoning_effort(model, opts.reasoning_level()) {
+            body.insert("reasoning_effort".into(), Value::String(effort));
         }
     }
     if !ctx.tools.is_empty() {
@@ -567,6 +567,26 @@ fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
     }
+}
+
+/// Resolve the `reasoning_effort` string for `model` at `level`.
+///
+/// Mirrors the TS provider's `model.thinkingLevelMap?.[effort] ?? effort`: the
+/// per-model map wins when it carries a non-null string for the level
+/// (e.g. `{"max": "max"}` sends `"max"`), otherwise the built-in table above.
+fn mapped_reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
+    let built_in = reasoning_effort(level)?;
+    if let Some(map) = &model.thinking_level_map {
+        if let Some(Some(value)) = map.get(&level).as_ref() {
+            if !value.is_empty() {
+                return Some(value.clone());
+            }
+            // Empty strings fall through to the built-in table; explicit
+            // null keeps the level hidden upstream, but at the request layer
+            // the built-in value is still the safest fallback.
+        }
+    }
+    Some(built_in.to_string())
 }
 
 fn has_auth_header(headers: &BTreeMap<String, String>) -> bool {

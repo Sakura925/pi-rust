@@ -1064,6 +1064,8 @@ pub fn default_thinking_budgets() -> crate::types::ThinkingBudgets {
         low: Some(2048),
         medium: Some(8192),
         high: Some(16384),
+        xhigh: None,
+        max: None,
     }
 }
 
@@ -1087,16 +1089,22 @@ pub fn adjust_max_tokens_for_thinking(
             low: c.low.or(defaults.low),
             medium: c.medium.or(defaults.medium),
             high: c.high.or(defaults.high),
+            xhigh: c.xhigh.or(c.high).or(defaults.high),
+            max: c.max.or(c.high).or(defaults.high),
         },
         None => defaults,
     };
-    let level = clamp_reasoning(reasoning_level);
-    let thinking_budget = match level {
+    // Xhigh/Max keep their own budget slots (falling back to high's), so a
+    // model can configure e.g. `thinkingBudgets.max = 32768` while `high`
+    // stays at 16384. Levels other than xhigh/max clamp as before.
+    let thinking_budget = match reasoning_level {
+        ThinkingLevel::Xhigh => budgets.xhigh.unwrap_or(16384),
+        ThinkingLevel::Max => budgets.max.unwrap_or(16384),
         ThinkingLevel::Minimal => budgets.minimal.unwrap_or(1024),
         ThinkingLevel::Low => budgets.low.unwrap_or(2048),
         ThinkingLevel::Medium => budgets.medium.unwrap_or(8192),
         ThinkingLevel::High => budgets.high.unwrap_or(16384),
-        _ => budgets.high.unwrap_or(16384),
+        ThinkingLevel::Off => 0,
     };
     let max_tokens = match base_max_tokens {
         None => model_max_tokens,
@@ -1325,11 +1333,17 @@ pub fn build_params(
             } else {
                 // Budget-based thinking.
                 let reasoning_level = opts.reasoning.unwrap_or(ThinkingLevel::High);
+                // Model-level `thinkingBudgets` (models.json) wins; the
+                // stream-options entry stays as an override channel.
+                let budgets = model
+                    .thinking_budgets
+                    .as_ref()
+                    .or(opts.thinking_budgets.as_ref());
                 let (adjusted_max, budget) = adjust_max_tokens_for_thinking(
                     opts.max_tokens,
                     model.max_tokens,
                     reasoning_level,
-                    opts.thinking_budgets.as_ref(),
+                    budgets,
                 );
                 // Re-clamp the adjusted max to the context window.
                 max_tokens = clamp_max_tokens_to_context(
@@ -1500,6 +1514,37 @@ mod tests {
         m.cost = ModelCost::default();
         m.compat = Some(StreamingProtocolCompat::AnthropicMessages(compat));
         m
+    }
+
+    #[test]
+    fn xhigh_max_have_own_budget_slots() {
+        use crate::types::ThinkingBudgets;
+        // Custom budgets: xhigh/max get their own slots; unset slots fall
+        // back to high (pre-0.3.23 behavior: all three == high).
+        let budgets = ThinkingBudgets {
+            high: Some(16_384),
+            xhigh: Some(32_768),
+            max: Some(49_152),
+            ..ThinkingBudgets::default()
+        };
+        let (_, x) =
+            adjust_max_tokens_for_thinking(None, 131_072, ThinkingLevel::Xhigh, Some(&budgets));
+        assert_eq!(x, 32_768);
+        let (_, m) =
+            adjust_max_tokens_for_thinking(None, 131_072, ThinkingLevel::Max, Some(&budgets));
+        assert_eq!(m, 49_152);
+        let (_, h) =
+            adjust_max_tokens_for_thinking(None, 131_072, ThinkingLevel::High, Some(&budgets));
+        assert_eq!(h, 16_384);
+    }
+
+    #[test]
+    fn xhigh_max_fall_back_to_high_budget_when_unset() {
+        // No custom budgets: xhigh/max == high (16384), unchanged legacy.
+        let (_, x) = adjust_max_tokens_for_thinking(None, 131_072, ThinkingLevel::Xhigh, None);
+        assert_eq!(x, 16_384);
+        let (_, m) = adjust_max_tokens_for_thinking(None, 131_072, ThinkingLevel::Max, None);
+        assert_eq!(m, 16_384);
     }
 
     #[test]

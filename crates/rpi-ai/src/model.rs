@@ -180,6 +180,10 @@ pub struct Model {
     pub reasoning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// Per-level thinking budgets (token counts) for budget-based reasoning
+    /// models. `None` uses provider defaults (1024/2048/8192/16384).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<crate::types::ThinkingBudgets>,
     pub input: Vec<InputModality>,
     pub cost: ModelCost,
     pub context_window: u64,
@@ -209,6 +213,7 @@ impl Model {
             base_url: base_url.into(),
             reasoning: false,
             thinking_level_map: None,
+            thinking_budgets: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 0,
