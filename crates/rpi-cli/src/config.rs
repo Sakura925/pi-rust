@@ -398,6 +398,15 @@ pub struct ModelDefinition {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<serde_json::Value>,
+    /// Per-model thinking-level → provider-effort map (camelCase keys: off,
+    /// minimal, low, medium, high, xhigh, max; null = unsupported).
+    /// Without this field the config layer dropped the user's map entirely —
+    /// the fourth porting gap from TS pi-ai.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<serde_json::Value>,
+    /// Per-level thinking budgets (tokens) for budget-based reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<serde_json::Value>,
 }
 
 /// Load `~/.rpi/models.json`. Missing file ⇒ empty config (no error).
@@ -910,6 +919,16 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         m.reasoning = def.reasoning.unwrap_or(false);
         m.context_window = def.context_window.unwrap_or(0);
         m.max_tokens = def.max_tokens.unwrap_or(0);
+        if let Some(value) = def.thinking_level_map.clone() {
+            if let Ok(map) = serde_json::from_value(value) {
+                m.thinking_level_map = Some(map);
+            }
+        }
+        if let Some(value) = def.thinking_budgets.clone() {
+            if let Ok(budgets) = serde_json::from_value(value) {
+                m.thinking_budgets = Some(budgets);
+            }
+        }
         m.input = parse_input_modalities(def.input.as_deref());
         // Merge: model-level headers, then provider-level headers (provider wins
         // on conflict — it's the more specific-to-this-endpoint declaration).

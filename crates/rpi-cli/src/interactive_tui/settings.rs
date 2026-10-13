@@ -1123,6 +1123,8 @@ pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String
             input: None,
             headers: None,
             compat: None,
+            thinking_level_map: None,
+            thinking_budgets: None,
         }],
     };
     cfg.providers.insert(form.id.clone(), provider);
