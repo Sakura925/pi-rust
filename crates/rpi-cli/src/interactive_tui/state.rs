@@ -331,6 +331,14 @@ pub(super) struct TuiState {
     /// `check_key_thread_heartbeat`); a wedged loop must not spam the log
     /// file every tick.
     pub(super) key_hang_reported: std::sync::atomic::AtomicBool,
+    /// Monotonic dialog/command generation. Every extension dialog open
+    /// (input/editor/selector, ask_user included) and every extension-command
+    /// execution (first-run or dialog continuation) bumps it. Background
+    /// continuations capture their generation before running the plugin
+    /// handler and compare it before rendering: a stale continuation (a newer
+    /// dialog/command claimed the slots meanwhile) degrades to a plain
+    /// message instead of opening UI over the fresh state.
+    pub(super) dialog_generation: std::sync::atomic::AtomicU64,
     /// Last queue snapshot rendered into `pending_container`. Lets
     /// `set_pending_queue` skip redundant rebuilds + frame requests when the
     /// polled queue is unchanged.
@@ -1168,8 +1176,12 @@ impl TuiState {
         // plugin: session lock + snapshot read only. The lock guards the O(1)
         // `Arc` clone — the fan-out runs outside it, bounded, so a stalled
         // extension handler can never wedge the UI tick (this runs on the main
-        // loop; a wedged tick freezes rendering and message handling).
-        let snapshot = {
+        // loop; a wedged tick freezes rendering and message handling). The
+        // keepalive is captured with the snapshot and held for the whole call:
+        // the snapshot alone does not own the plugin libraries, and a
+        // `/reload` mid-flight would otherwise unmap the dylibs under a
+        // still-running handler.
+        let (snapshot, keepalive) = {
             let Ok(session) = self.extension_session.lock() else {
                 return;
             };
@@ -1179,12 +1191,13 @@ impl TuiState {
             if snapshot.handlers_for(EventTag::EditorChange).is_empty() {
                 return;
             }
-            snapshot
+            (snapshot, session.keepalive())
         };
         let snapshot = std::sync::Arc::clone(&snapshot);
         crate::interactive_tui::bounded_handler_call(
             crate::interactive_tui::UI_EVENT_DISPATCH_BUDGET,
             move || {
+                let _keepalive = keepalive;
                 rpi_extensions::dispatch_data_event(
                     &snapshot,
                     EventTag::EditorChange,

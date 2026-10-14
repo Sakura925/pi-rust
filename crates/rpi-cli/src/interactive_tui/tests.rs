@@ -486,6 +486,7 @@ fn test_tui_state() -> Arc<TuiState> {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -1561,6 +1562,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2205,6 +2207,7 @@ fn test_autocomplete_slash_suggestions_render() {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2299,6 +2302,7 @@ fn test_select_list_swap_restores_editor() {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2396,6 +2400,7 @@ fn test_message_history_browse_restores_draft() {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2496,6 +2501,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2582,6 +2588,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
             key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2992,4 +2999,49 @@ fn bounded_handler_call_passes_through_fast_handlers() {
         "done"
     });
     assert_eq!(result.as_deref(), Some("done"));
+}
+
+/// Regression for the fourth hang: the dialog-key router must release the
+/// slot mutexes BEFORE dispatching into the widget. The widget's submit
+/// callback re-enters those same mutexes (`close_extension_editor`'s
+/// cleanup); an inline `if let state.lock()...` keeps the temporary guard
+/// alive to the end of the whole if/else (Edition 2021) and self-deadlocks
+/// the key thread — the fourth hang froze exactly there, and the try_lock
+/// fallback only turned it into a leaked stale dialog. If the router ever
+/// holds a guard again, the `lock()` inside the callback below hangs this
+/// test instead. Afterwards the slot must be free so the next ask_user can
+/// display.
+#[test]
+fn dialog_key_routing_releases_slot_locks_before_widget_callbacks() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let state = test_tui_state();
+    let input = Arc::new(rpi_tui::Input::with_placeholder("answer…"));
+    let state_cb = state.clone();
+    let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submitted_cb = submitted.clone();
+    input.on_submit(Arc::new(move |_: &str| {
+        // Re-enter BOTH slot locks from inside the callback: deadlocks if the
+        // router still holds a guard across the widget call.
+        let editor_slot_empty = state_cb.active_extension_editor.lock().unwrap().is_none();
+        assert!(editor_slot_empty, "editor slot observed while re-enterable");
+        let mut input_slot = state_cb.active_extension_input.lock().unwrap();
+        let was_some = input_slot.is_some();
+        *input_slot = None; // simulate close_extension_editor's cleanup
+        drop(input_slot);
+        assert!(was_some, "callback ran while the dialog input was live");
+        submitted_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    *state.active_extension_input.lock().unwrap() = Some(input);
+    assert!(state.extension_dialog_open());
+
+    // Route an Enter through the real dialog-key path.
+    route_extension_dialog_key(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(
+        submitted.load(std::sync::atomic::Ordering::SeqCst),
+        "submit callback ran through the router"
+    );
+    // The slot is free again — the next ask_user can claim it.
+    assert!(!state.extension_dialog_open());
 }

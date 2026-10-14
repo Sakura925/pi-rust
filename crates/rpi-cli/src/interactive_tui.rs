@@ -372,11 +372,13 @@ impl CommandRegistry {
 fn dispatch_ui_prompt_event(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    let snapshot = session_snapshot_bounded(state, EventTag::UiPromptStart);
-    let Some(snapshot) = snapshot else {
+    let Some((snapshot, keepalive)) =
+        session_snapshot_bounded(state, EventTag::UiPromptStart)
+    else {
         return;
     };
     bounded_handler_call(UI_EVENT_DISPATCH_BUDGET, move || {
+        let _keepalive = keepalive;
         rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
     });
 }
@@ -386,11 +388,13 @@ fn dispatch_ui_prompt_event(state: &TuiState) {
 fn dispatch_ui_prompt_event_end(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    let snapshot = session_snapshot_bounded(state, EventTag::UiPromptEnd);
-    let Some(snapshot) = snapshot else {
+    let Some((snapshot, keepalive)) =
+        session_snapshot_bounded(state, EventTag::UiPromptEnd)
+    else {
         return;
     };
     bounded_handler_call(UI_EVENT_DISPATCH_BUDGET, move || {
+        let _keepalive = keepalive;
         rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
     });
 }
@@ -409,16 +413,28 @@ const INPUT_CLAIM_DISPATCH_BUDGET: std::time::Duration =
 /// Snapshot the extension registry with the session lock held only for the
 /// `Arc` clone, skipping the dispatch entirely when no handler subscribes to
 /// `tag` (the common case must pay neither a thread spawn nor a wait).
+/// Snapshot the extension registry with the session lock held only for the
+/// `Arc` clone, together with the `PluginKeepalive` that OWNS the plugin
+/// dynamic libraries. The keepalive must be captured with the snapshot and
+/// held by the executing thread for as long as it calls plugin code: a
+/// snapshot alone only carries function pointers + user_data, so a `/reload`
+/// that swaps the session out could unload the dylibs while a
+/// timed-out-but-still-running handler executes (drop-after-unload = call
+/// into unmapped memory). Same contract as `shutdown_extensions_for_reload`
+/// (session.rs), which already captures the pair.
 fn session_snapshot_bounded(
     state: &TuiState,
     tag: rpi_plugin_sdk::EventTag,
-) -> Option<Arc<rpi_extensions::RegistrySnapshot>> {
+) -> Option<(
+    Arc<rpi_extensions::RegistrySnapshot>,
+    Arc<rpi_extensions::PluginKeepalive>,
+)> {
     let session = state.extension_session.lock().ok()?;
     let snapshot = session.snapshot_arc()?;
     if snapshot.handlers_for(tag).is_empty() {
         return None;
     }
-    Some(snapshot)
+    Some((snapshot, session.keepalive()))
 }
 
 /// Run `f` on a detached thread and wait at most `budget`. Returns `None` on
@@ -454,6 +470,11 @@ fn check_key_thread_heartbeat(state: &Arc<TuiState>) {
     let now = key_heartbeat_now(state);
     let elapsed_ms = now.saturating_sub(beat);
     if elapsed_ms < KEY_THREAD_HANG_BUDGET.as_millis() as u64 {
+        // Recovered: re-arm the one-shot so a LATER hang reports again
+        // (otherwise the first recovery silences the watchdog forever).
+        state
+            .key_hang_reported
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     // One-shot: arm the flag inside the heartbeat field by storing a sentinel
@@ -530,6 +551,29 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Route a key to the active extension dialog widget (editor first, then
+/// input).
+///
+/// The widgets are cloned OUT of their slot mutexes BEFORE `handle_key` is
+/// called: the dialog widgets' submit/cancel callbacks re-enter those same
+/// mutexes (via `close_extension_editor`), and a guard held across the call —
+/// which is exactly what an inline `if let state.lock()...` does in Edition
+/// 2021, the temporary living to the end of the whole if/else — self-
+/// deadlocks the key thread. The fourth hang froze exactly here, and the
+/// `try_lock` fallback in `close_extension_editor` only degraded that
+/// deadlock into a leaked stale dialog. Releasing before the call keeps the
+/// re-entry a plain, correct lock acquisition. Extracted so the contract is
+/// unit-testable.
+fn route_extension_dialog_key(state: &Arc<TuiState>, key: KeyEvent) {
+    let active_editor = state.active_extension_editor.lock().unwrap().clone();
+    let active_input = state.active_extension_input.lock().unwrap().clone();
+    if let Some(extension_editor) = active_editor {
+        extension_editor.handle_key(key);
+    } else if let Some(extension_input) = active_input {
+        extension_input.handle_key(key);
+    }
+}
+
 /// Canonical key name for a key event, matching the vocabulary
 /// [`parse_configured_key`] accepts (`"space"`, `"enter"`, `"f1"`, `"a"`).
 /// `None` for keys that cannot be named (media keys, unknown codes).
@@ -604,8 +648,12 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     // Snapshot + cheap pre-checks under the session lock (no handler runs
     // while it is held); the claiming dispatch itself runs outside the lock
     // with a bounded wait so a stalled extension can never wedge the key
-    // thread — a timeout degrades the key to its normal editor routing.
-    let snapshot = {
+    // thread — a timeout degrades the key to its normal editor routing. The
+    // keepalive is captured with the snapshot and held for the whole call:
+    // the snapshot alone does not own the plugin libraries, and a `/reload`
+    // mid-flight would otherwise unmap the dylibs under a still-running
+    // handler.
+    let (snapshot, keepalive) = {
         let Ok(session) = state.extension_session.lock() else {
             return false;
         };
@@ -616,7 +664,7 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
         if !snapshot.has_shortcut(&name) || snapshot.handlers_for(EventTag::Input).is_empty() {
             return false;
         }
-        snapshot
+        (snapshot, session.keepalive())
     };
     // Function keys do not insert text. Other keys belong to the draft editor
     // while composing (space especially).
@@ -640,13 +688,14 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     .to_string();
     // The handler decides whether it actually wants the key: it returns the
     // `CLAIMED` code while its feature is active and `CONTINUE` otherwise, so a
-    // registered-but-disabled shortcut (push-to-talk toggled off) still lets the
-    // key reach the editor normally. A stalled handler times out as
-    // not-claimed; its detached thread finishes on its own (snapshot `Arc` in
-    // its closure keeps the plugin libraries alive until then).
+    // registered-but-disabled shortcut (push-to-talk toggled off) still lets
+    // the key reach the editor normally. A stalled handler times out as
+    // not-claimed; its detached thread finishes on its own (the captured
+    // keepalive keeps the plugin libraries loaded until it returns).
     let claimed = bounded_handler_call(INPUT_CLAIM_DISPATCH_BUDGET, {
         let payload = payload.clone();
         move || {
+            let _keepalive = keepalive;
             rpi_extensions::dispatch_data_event_claiming(
                 &snapshot,
                 EventTag::Input,
@@ -1377,6 +1426,7 @@ pub async fn interactive_tui(
         key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             tui_start_instant: std::time::Instant::now(),
             key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+            dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2097,17 +2147,8 @@ pub async fn interactive_tui(
                             &tui_for_key,
                         );
                     }
-                } else if let Some(extension_editor) = state_for_key
-                    .active_extension_editor
-                    .lock()
-                    .unwrap()
-                    .clone()
-                {
-                    extension_editor.handle_key(key);
-                } else if let Some(extension_input) =
-                    state_for_key.active_extension_input.lock().unwrap().clone()
-                {
-                    extension_input.handle_key(key);
+                } else {
+                    route_extension_dialog_key(&state_for_key, key);
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;

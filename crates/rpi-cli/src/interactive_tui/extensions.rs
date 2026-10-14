@@ -36,24 +36,71 @@ impl SlashCommand for ExtensionCommand {
         // stalled, the action queued on the harness forever, and the key
         // thread waited forever — input, dialogs and Ctrl+C all dead while the
         // runtime sat fully idle. Spawning also keeps the editor clear path
-        // (the caller clears the draft once `execute` returns) intact.
-        let ctx = ctx.clone();
-        let session = self.session.clone();
-        let name = self.name.clone();
+        // (the caller clears the draft once `execute` returns) intact. The
+        // generation counter inside guards against a stale result rendering
+        // over a newer dialog/command.
         let args = args.to_string();
-        let session_for_result = session.clone();
-        let name_for_result = name.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            invoke_extension_command(&session, &name, &args)
-        });
-        tokio::spawn(async move {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(_) => None,
-            };
-            handle_extension_ui_result(result, &ctx, session_for_result, name_for_result);
-        });
+        run_extension_continuation(
+            ctx,
+            &ctx.state,
+            self.session.clone(),
+            self.name.clone(),
+            args,
+        );
     }
+}
+
+/// Run a plugin command continuation (dialog submit/select/cancel, or a
+/// first-run slash command) OFF the key thread.
+///
+/// A continuation's plugin handler may park on a heavyweight runtime action
+/// exactly like a first-run command (`/runloom`'s `SendUserMessage` froze the
+/// whole TUI this way); the key thread must therefore never wait on it. The
+/// dialog is closed FIRST by the caller (key thread, try_lock path — never
+/// blocks); here the handler runs on `spawn_blocking` and its result renders
+/// through the async path. The dialog generation guards the result: if a
+/// newer dialog/command claimed the slots while the handler ran, the stale
+/// result degrades to a plain message instead of opening UI over the fresh
+/// state.
+pub(super) fn run_extension_continuation(
+    ctx: &CommandContext,
+    state: &Arc<TuiState>,
+    session: crate::session::ExtensionSessionCell,
+    command_name: String,
+    args: String,
+) {
+    use std::sync::atomic::Ordering;
+    let ctx = ctx.clone();
+    let state = state.clone();
+    let generation = state.dialog_generation.fetch_add(1, Ordering::AcqRel);
+    tokio::spawn(async move {
+        let session_run = session.clone();
+        let name_run = command_name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            invoke_extension_command(&session_run, &name_run, &args)
+        })
+        .await
+        .ok()
+        .flatten();
+        // Stale guard: another dialog/command opened while this handler ran.
+        // Degrade to a plain message so the stale continuation cannot open UI
+        // over the fresh dialog state.
+        if state.dialog_generation.load(Ordering::Acquire) != generation + 1 {
+            if let Some(value) = &result {
+                let text = value
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned);
+                if let Some(text) = text {
+                    add_note_message(&ctx.chat, &text);
+                }
+            }
+            ctx.tui.request_render(false);
+            return;
+        }
+        handle_extension_ui_result(result, &ctx, session, command_name);
+    });
 }
 
 pub(super) fn invoke_extension_command(
@@ -61,16 +108,21 @@ pub(super) fn invoke_extension_command(
     name: &str,
     args: &str,
 ) -> Option<serde_json::Value> {
-    let command = session
-        .lock()
-        .ok()
-        .and_then(|s| s.snapshot_arc())
-        .and_then(|snap| {
-            snap.commands()
-                .iter()
-                .find(|c| c.name.trim_start_matches('/') == name.trim_start_matches('/'))
-                .cloned()
-        })?;
+    // Capture the keepalive together with the command handle: the handle
+    // only carries function pointers + user_data, so a `/reload` swapping
+    // the session mid-call would otherwise unmap the plugin dylibs while
+    // the handler is still executing (call into unmapped memory). The
+    // keepalive owns the libraries and outlives the call here.
+    let (command, _keepalive) = {
+        let session = session.lock().ok()?;
+        let snapshot = session.snapshot_arc()?;
+        let command = snapshot
+            .commands()
+            .iter()
+            .find(|c| c.name.trim_start_matches('/') == name.trim_start_matches('/'))
+            .cloned()?;
+        (command, session.keepalive())
+    };
     let input = serde_json::json!({ "args": args, "command": name });
     let input = serde_json::to_string(&input).ok()?;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -194,6 +246,12 @@ pub(super) fn open_extension_input(
     command_name: String,
     value: serde_json::Value,
 ) {
+    // Bump the dialog generation: any extension-command continuation still
+    // running in the background becomes stale when this dialog claims the
+    // input slot, so its result will degrade to a message instead of
+    // opening UI over this fresh dialog.
+    use std::sync::atomic::Ordering as _GenOrdering;
+    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
     let title = value
         .get("title")
         .and_then(|v| v.as_str())
@@ -244,18 +302,19 @@ pub(super) fn open_extension_input(
     let command_submit = command_name.clone();
     let ctx_submit = ctx.clone();
     input.on_submit(Arc::new(move |text| {
-        let args = serde_json::json!({ "action": "input", "value": text, "text": text });
-        let result = invoke_extension_command(
-            &session_submit,
-            &command_submit,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        let args =
+            serde_json::json!({ "action": "input", "value": text, "text": text }).to_string();
+        // Close the dialog FIRST on the key thread (try_lock path — never
+        // blocks), then run the continuation's handler off-thread: it may
+        // park on a heavyweight runtime action exactly like a first-run
+        // command, and the key thread must never wait on it.
         close_extension_editor(&state, &ec, &original, &tui);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_submit,
+            &state,
             session_submit.clone(),
             command_submit.clone(),
+            args,
         );
     }));
 
@@ -267,18 +326,15 @@ pub(super) fn open_extension_input(
     let command_cancel = command_name.clone();
     let ctx_cancel = ctx.clone();
     *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        let args = serde_json::json!({ "action": "cancel" });
-        let result = invoke_extension_command(
-            &session_cancel,
-            &command_cancel,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        // Close FIRST (key thread, try_lock path), then run the cancel
+        // continuation off-thread — the handler may park on a runtime action.
         close_extension_editor(&state_cancel, &ec_cancel, &original_cancel, &tui_cancel);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_cancel,
+            &state_cancel,
             session_cancel.clone(),
             command_cancel.clone(),
+            serde_json::json!({ "action": "cancel" }).to_string(),
         );
     }));
 
@@ -292,6 +348,12 @@ pub(super) fn open_extension_selector(
     command_name: String,
     value: serde_json::Value,
 ) {
+    // Bump the dialog generation: any extension-command continuation still
+    // running in the background becomes stale when this dialog claims the
+    // input slot, so its result will degrade to a message instead of
+    // opening UI over this fresh dialog.
+    use std::sync::atomic::Ordering as _GenOrdering;
+    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
     let items = value
         .get("items")
         .and_then(|v| v.as_array())
@@ -348,18 +410,16 @@ pub(super) fn open_extension_selector(
     let command_select = command_name.clone();
     let ctx_select = ctx.clone();
     list.on_select(Arc::new(move |item| {
-        let args = serde_json::json!({ "action": "select", "value": item.value });
-        let result = invoke_extension_command(
-            &session_select,
-            &command_select,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        let args = serde_json::json!({ "action": "select", "value": item.value }).to_string();
+        // Close FIRST (key thread), then off-thread — see the input dialog's
+        // on_submit.
         close_selector(&state, &ec, &editor, &tui);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_select,
+            &state,
             session_select.clone(),
             command_select.clone(),
+            args,
         );
     }));
     let state_cancel = ctx.state.clone();
@@ -379,18 +439,15 @@ pub(super) fn open_extension_selector(
     let command_cancel = command_name.clone();
     let ctx_cancel = ctx.clone();
     *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        let args = serde_json::json!({ "action": "cancel" });
-        let result = invoke_extension_command(
-            &session_cancel,
-            &command_cancel,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        // Close FIRST (key thread, try_lock path), then run the cancel
+        // continuation off-thread — the handler may park on a runtime action.
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_cancel,
+            &state_cancel,
             session_cancel.clone(),
             command_cancel.clone(),
+            serde_json::json!({ "action": "cancel" }).to_string(),
         );
     }));
     open_selector_with_view(
@@ -410,6 +467,12 @@ pub(super) fn open_extension_editor(
     command_name: String,
     value: serde_json::Value,
 ) {
+    // Bump the dialog generation: any extension-command continuation still
+    // running in the background becomes stale when this dialog claims the
+    // input slot, so its result will degrade to a message instead of
+    // opening UI over this fresh dialog.
+    use std::sync::atomic::Ordering as _GenOrdering;
+    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
     let initial = value
         .get("initialText")
         .or_else(|| value.get("text"))
@@ -469,18 +532,16 @@ pub(super) fn open_extension_editor(
     let command_submit = command_name.clone();
     let ctx_submit = ctx.clone();
     editor.on_submit(Arc::new(move |text| {
-        let args = serde_json::json!({ "action": "edit", "text": text });
-        let result = invoke_extension_command(
-            &session_submit,
-            &command_submit,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        let args = serde_json::json!({ "action": "edit", "text": text }).to_string();
+        // Close FIRST (key thread, try_lock path), then off-thread — see the
+        // input dialog's on_submit.
         close_extension_editor(&state, &ec, &original, &tui);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_submit,
+            &state,
             session_submit.clone(),
             command_submit.clone(),
+            args,
         );
     }));
 
@@ -492,18 +553,15 @@ pub(super) fn open_extension_editor(
     let command_cancel = command_name.clone();
     let ctx_cancel = ctx.clone();
     *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        let args = serde_json::json!({ "action": "cancel" });
-        let result = invoke_extension_command(
-            &session_cancel,
-            &command_cancel,
-            &serde_json::to_string(&args).unwrap_or_default(),
-        );
+        // Close FIRST (key thread, try_lock path), then run the cancel
+        // continuation off-thread — the handler may park on a runtime action.
         close_extension_editor(&state_cancel, &ec_cancel, &original_cancel, &tui_cancel);
-        handle_extension_ui_result(
-            result,
+        run_extension_continuation(
             &ctx_cancel,
+            &state_cancel,
             session_cancel.clone(),
             command_cancel.clone(),
+            serde_json::json!({ "action": "cancel" }).to_string(),
         );
     }));
 
@@ -915,6 +973,12 @@ pub(super) fn open_ask_user_input(
     request: rpi_extensions::UiDialogRequest,
     prompt: AskUserPrompt,
 ) {
+    // Bump the dialog generation: any extension-command continuation still
+    // running in the background becomes stale when this dialog claims the
+    // input slot, so its result will degrade to a message instead of
+    // opening UI over this fresh dialog.
+    use std::sync::atomic::Ordering as _GenOrdering;
+    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
     let placeholder = prompt
         .suggest
         .clone()
