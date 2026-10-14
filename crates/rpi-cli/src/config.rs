@@ -1314,6 +1314,8 @@ mod tests {
                 input: None,
                 headers: None,
                 compat: None,
+                thinking_level_map: None,
+                thinking_budgets: None,
             }],
         };
         let models = provider_to_models("gateway", &cfg).expect("anthropic-compatible");
@@ -1441,6 +1443,8 @@ mod tests {
                 input: None,
                 headers: None,
                 compat: None,
+                thinking_level_map: None,
+                thinking_budgets: None,
             }],
         };
         let models = provider_to_models("rpi-fake-provider", &cfg).unwrap();
