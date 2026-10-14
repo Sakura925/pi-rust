@@ -19,6 +19,16 @@
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |
 
+## fork 个人文档（上游没有的部分）
+
+| 内容 | 文档 |
+| --- | --- |
+| 本地构建与晋级流水（commit/产物 hash/验证记录） | [local-builds](local-builds.md) |
+| 同步上游与分支模型（main 镜像 → feat/* → local_master） | [.rpi/skills/rpi-fork-sync/SKILL.md](../.rpi/skills/rpi-fork-sync/SKILL.md)（仅本地，不进库） |
+| RSI 接入调研结论（四阶段试点路线） | [rsi-integration-research](rsi-integration-research.md) |
+| 需求/spec（活跃开发中的需求文档） | [specs/](specs/) |
+| 已完结的过程档案（交接/审查/裁决，按主题一组） | [archive/](archive/) |
+
 ## 维护约定
 
 - 使用与实现文档放入对应功能目录，修改行为时同步更新说明。
@@ -26,3 +36,5 @@
 - 发布记录维护在根目录 `CHANGELOG.md`，不再新增重复的单版本发布说明。
 - 已失效的里程碑问题记录、差距表与旧版本宣传稿已移除；Git 历史仍可查询。
 - 调试复盘与基准结果保留日期和适用范围，不作为当前功能缺失清单。
+- fork 过程文档生命周期：活跃期留在根目录或 specs/；完结后归档到 `archive/<主题>/`，取证大文件（sample/jsonl）不进版本库，存 `~/.rpi/logs/evidence-archive/`。
+- `promotion/` 是上游作者的推广文章目录，与 fork 的本地构建晋级（`local-builds.md`）无关，勿混。
