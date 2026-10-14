@@ -151,6 +151,21 @@ pub enum SessionSelection {
     Fork { source: String },
 }
 
+/// The hard language directive injected when `settings.language` is set.
+/// Unlike the base prompt's detect-and-mirror rule, this locks the language:
+/// models drift back to English mid-conversation otherwise (long sessions full
+/// of English code/tool output pull the reasoning language with them).
+fn language_lock_directive(language: &str) -> String {
+    format!(
+        "Language lock (user-configured): ALL your output MUST be written in {language} — \
+your visible replies AND your internal reasoning/thinking blocks alike. Never drift to any \
+other language mid-conversation: code, file paths, commands, identifiers, and tool syntax \
+stay verbatim, but every sentence you think or write — plans, analysis, reasoning, \
+summaries, questions back to the user — MUST be {language}. This is a hard requirement; \
+do not answer or reason in any other language."
+    )
+}
+
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.no_session {
@@ -392,6 +407,18 @@ pub async fn build(
                 append_texts.push(text);
             }
         }
+    }
+    // Language lock (settings.language): a configured value prepends a hard
+    // directive ahead of every other append source — the detect-and-mirror
+    // base rule stays, but an explicit lock wins. First among the append
+    // texts, so a user's explicit `--append-system-prompt` can still refine it.
+    if let Some(language) = crate::settings::load_effective_model_settings(cwd, project_trusted)
+        .ok()
+        .and_then(|settings| settings.language)
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+    {
+        append_texts.insert(0, language_lock_directive(&language));
     }
     let append_join = if append_texts.is_empty() {
         None
@@ -3023,6 +3050,24 @@ mod tests {
         assert!(!p.contains("- powershell"));
         assert!(p.contains("Bash/POSIX syntax, including on Windows"));
         assert!(p.contains("do not pass PowerShell cmdlets"));
+    }
+
+    #[test]
+    fn language_lock_directive_locks_thinking_and_replies() {
+        // A configured `language` must produce a hard directive that (a) names
+        // the configured language, (b) explicitly covers thinking blocks, and
+        // (c) forbids other languages — the three properties that make the
+        // lock stick where detect-and-mirror drifts.
+        let d = language_lock_directive("中文");
+        assert!(d.contains("中文"), "names the configured language: {d}");
+        assert!(
+            d.to_lowercase().contains("thinking"),
+            "covers thinking blocks: {d}"
+        );
+        assert!(
+            d.to_lowercase().contains("must"),
+            "imperative wording: {d}"
+        );
     }
 
     #[test]

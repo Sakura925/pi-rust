@@ -98,6 +98,14 @@ pub struct Settings {
     /// Saved theme name. Surfaced for best-effort TUI theme application.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Lock the assistant's output language — thinking AND replies. Accepts a
+    /// language name or code ("zh", "zh-CN", "中文", "English", …). When set,
+    /// a hard language directive is injected into the system prompt ahead of
+    /// any append text, overriding the default detect-and-mirror rule: models
+    /// otherwise drift back to English mid-conversation (especially in long
+    /// sessions full of English code/tool output).
+    #[serde(default)]
+    pub language: Option<String>,
     /// `/scoped-models`: the model ids allowed in the Ctrl+P cycle. Absent /
     /// empty ⇒ every catalog model cycles (the default). upstream spells this
     /// `enabledModels`, which is accepted as an alias so a copied `settings.json`
@@ -431,6 +439,9 @@ pub fn load_effective_model_settings(
             if project.theme.is_some() {
                 effective.theme = project.theme;
             }
+            if project.language.is_some() {
+                effective.language = project.language;
+            }
         }
     }
     Ok(effective)
@@ -549,6 +560,7 @@ fn save_settings_to_path(
             settings.default_thinking_level.as_ref(),
         ),
         ("theme", settings.theme.as_ref()),
+        ("language", settings.language.as_ref()),
         (
             "lastChangelogVersion",
             settings.last_changelog_version.as_ref(),
@@ -767,6 +779,7 @@ mod tests {
                 "defaultModel": "claude-sonnet-5",
                 "defaultThinkingLevel": "high",
                 "theme": "dark",
+                "language": "zh-CN",
                 "hideThinkingBlock": true,
                 "quietStartup": true,
                 "disableUpdateCheck": true,
@@ -782,6 +795,7 @@ mod tests {
         assert_eq!(s.default_model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(s.default_thinking_level.as_deref(), Some("high"));
         assert_eq!(s.theme.as_deref(), Some("dark"));
+        assert_eq!(s.language.as_deref(), Some("zh-CN"));
         assert_eq!(s.hide_thinking_block, Some(true));
         assert_eq!(s.quiet_startup, Some(true));
         assert_eq!(s.disable_update_check, Some(true));
