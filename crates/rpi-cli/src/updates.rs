@@ -134,7 +134,12 @@ pub async fn check_rpi_startup() -> UpdateReport {
 }
 
 fn update_checks_disabled() -> bool {
-    crate::args::offline_env_enabled() || std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_some()
+    crate::args::offline_env_enabled()
+        || std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_some()
+        || crate::settings::load_settings()
+            .ok()
+            .and_then(|settings| settings.disable_update_check)
+            .unwrap_or(false)
 }
 
 /// Report the outcome of a self-update that ran in a previous process.
@@ -2692,6 +2697,34 @@ mod tests {
         assert!(
             !agent.exists(),
             "offline checks must not create the update cache directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_update_check_setting_skips_startup_checks() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let _restore_offline = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
+        let _restore_disabled = RestoreEnv::capture("RPI_DISABLE_UPDATE_CHECK");
+        let temp = real_tempdir();
+        let agent = temp.path().join("no-check-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        // The global settings scope carries the persistent opt-out.
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"disableUpdateCheck": true}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::remove_var(crate::args::RPI_OFFLINE_ENV);
+        std::env::remove_var("RPI_DISABLE_UPDATE_CHECK");
+
+        let report = super::check_rpi_startup().await;
+
+        assert_eq!(report, super::UpdateReport::default());
+        assert!(
+            !agent.join("update-check.json").exists(),
+            "a disabled check must not touch the update cache"
         );
     }
 

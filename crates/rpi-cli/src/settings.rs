@@ -188,6 +188,13 @@ pub struct Settings {
     /// Update checks remain enabled, matching upstream.
     #[serde(default)]
     pub quiet_startup: Option<bool>,
+    /// Disable the startup update check (rpi release + native packages) and
+    /// the resulting "update available" notices. Read from the global
+    /// `~/.rpi/agent/settings.json`; `RPI_DISABLE_UPDATE_CHECK` and offline
+    /// mode stay equivalent one-shot overrides. Useful on a fork: `rpi update`
+    /// would pull the upstream crates.io build, not the fork's own.
+    #[serde(default)]
+    pub disable_update_check: Option<bool>,
     /// Legacy/imported marker retained for settings compatibility. Only known
     /// rpi release versions are migrated into the dedicated rpi marker.
     #[serde(default)]
@@ -603,6 +610,12 @@ fn save_settings_to_path(
             settings.hide_thinking_block.map(serde_json::Value::Bool),
         ),
         (
+            "disableUpdateCheck",
+            settings
+                .disable_update_check
+                .map(serde_json::Value::Bool),
+        ),
+        (
             "quietStartup",
             settings.quiet_startup.map(serde_json::Value::Bool),
         ),
@@ -756,6 +769,7 @@ mod tests {
                 "theme": "dark",
                 "hideThinkingBlock": true,
                 "quietStartup": true,
+                "disableUpdateCheck": true,
                 "showTerminalProgress": false,
                 "editorPaddingX": 3,
                 "autocompleteMaxVisible": 7,
@@ -770,6 +784,7 @@ mod tests {
         assert_eq!(s.theme.as_deref(), Some("dark"));
         assert_eq!(s.hide_thinking_block, Some(true));
         assert_eq!(s.quiet_startup, Some(true));
+        assert_eq!(s.disable_update_check, Some(true));
         assert_eq!(s.show_terminal_progress, Some(false));
         assert_eq!(s.editor_padding_x, Some(3));
         assert_eq!(s.autocomplete_max_visible, Some(7));
@@ -1024,6 +1039,33 @@ mod scoped_tests {
         s2.scoped_models = None;
         save_settings(&s2).unwrap();
         assert_eq!(load_settings().unwrap().scoped_models, None);
+    }
+
+    #[test]
+    fn save_load_disable_update_check_roundtrip() {
+        let (_tmp, _guard) = with_temp_env();
+        // An existing unrelated configuration survives the save.
+        let path = config::settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"defaultModel":"keep-me"}"#).unwrap();
+
+        let mut s = load_settings().unwrap();
+        assert_eq!(s.disable_update_check, None);
+        s.disable_update_check = Some(true);
+        save_settings(&s).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"disableUpdateCheck\": true") && text.contains("\"defaultModel\": \"keep-me\""),
+            "save must overlay the flag without losing existing keys: {text}"
+        );
+        assert_eq!(load_settings().unwrap().disable_update_check, Some(true));
+
+        // Clearing removes the key again.
+        let mut s2 = load_settings().unwrap();
+        s2.disable_update_check = None;
+        save_settings(&s2).unwrap();
+        assert_eq!(load_settings().unwrap().disable_update_check, None);
     }
 
     #[test]
