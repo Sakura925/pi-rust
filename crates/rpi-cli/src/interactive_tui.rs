@@ -2120,7 +2120,14 @@ pub async fn interactive_tui(
                 && !state_for_key.selector_open()
                 && pet::active(&state_for_key.ext_status)
             {
-                let _ = invoke_extension_command(&state_for_key.extension_session, "pet", "quiet");
+                // Off the key thread, like every other extension command: a
+                // plugin handler may park on a runtime action and must never
+                // freeze input (see `ExtensionCommand::execute`).
+                let session_for_quiet = state_for_key.extension_session.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ =
+                        invoke_extension_command(&session_for_quiet, "pet", "quiet");
+                });
                 tui_for_key.request_render(false);
                 if *state_for_key.status.lock().unwrap() == RunStatus::Idle
                     && editor_for_key.get_text().is_empty()

@@ -26,8 +26,33 @@ impl SlashCommand for ExtensionCommand {
     }
 
     fn execute(&self, ctx: &CommandContext, args: &str) {
-        let result = invoke_extension_command(&self.session, &self.name, args);
-        handle_extension_ui_result(result, ctx, self.session.clone(), self.name.clone());
+        // Run extension commands OFF the key thread: the handler is a raw FFI
+        // call into a plugin, and plugins may invoke heavyweight runtime
+        // actions — `SendUserMessage` (drives a full run), `Compact`, reload…
+        // — whose trampoline parks the caller on a result channel until the
+        // action completes. Executing synchronously here (the spawn_blocking
+        // key loop) once froze the whole TUI: `/runloom` dispatched
+        // `SendUserMessage` behind an in-flight run whose provider stream had
+        // stalled, the action queued on the harness forever, and the key
+        // thread waited forever — input, dialogs and Ctrl+C all dead while the
+        // runtime sat fully idle. Spawning also keeps the editor clear path
+        // (the caller clears the draft once `execute` returns) intact.
+        let ctx = ctx.clone();
+        let session = self.session.clone();
+        let name = self.name.clone();
+        let args = args.to_string();
+        let session_for_result = session.clone();
+        let name_for_result = name.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            invoke_extension_command(&session, &name, &args)
+        });
+        tokio::spawn(async move {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => None,
+            };
+            handle_extension_ui_result(result, &ctx, session_for_result, name_for_result);
+        });
     }
 }
 
