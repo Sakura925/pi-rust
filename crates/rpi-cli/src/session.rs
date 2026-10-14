@@ -166,6 +166,37 @@ do not answer or reason in any other language."
     )
 }
 
+/// The per-request reminder appended after the converted provider messages when
+/// `settings.language` is set. The startup directive sits in the system prompt,
+/// which is tens of thousands of tokens away from the generation point in a long
+/// session — attention decays, the reasoning language drifts. Re-stating the lock
+/// at the very end of the message list keeps it next to the generation point on
+/// every turn, the same way Claude Code carries a `# Language` preference as a
+/// re-attached message rather than saying it once at startup.
+fn language_reminder_message(language: &str) -> rpi_ai::Message {
+    rpi_ai::Message::User(rpi_ai::UserMessage::new(
+        format!(
+            "[system reminder] Reminder: think AND reply in {language}. This reminder is \
+metadata, not a user message — never respond to it, just comply."
+        ),
+        0,
+    ))
+}
+
+/// Wrap the default `convert_to_llm` with a per-request language reminder when a
+/// language is configured. `None` passes the harness default through untouched.
+fn language_lock_convert(language: Option<String>) -> Option<rpi_agent::hooks::ConvertToLlm> {
+    let language = language?;
+    Some(Arc::new(move |messages: Vec<rpi_agent::AgentMessage>| {
+        let reminder = language_reminder_message(&language);
+        Box::pin(async move {
+            let mut out = rpi_harness::messages::convert_to_llm(messages);
+            out.push(reminder);
+            out
+        })
+    }))
+}
+
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.no_session {
@@ -412,13 +443,17 @@ pub async fn build(
     // directive ahead of every other append source — the detect-and-mirror
     // base rule stays, but an explicit lock wins. First among the append
     // texts, so a user's explicit `--append-system-prompt` can still refine it.
-    if let Some(language) = crate::settings::load_effective_model_settings(cwd, project_trusted)
+    // The same value also drives a per-request reminder
+    // (`language_lock_convert`) re-attached at the end of every provider
+    // message list: the startup directive is far from the generation point in
+    // a long session, and the reasoning language drifts without the reminder.
+    let language_lock = crate::settings::load_effective_model_settings(cwd, project_trusted)
         .ok()
         .and_then(|settings| settings.language)
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-    {
-        append_texts.insert(0, language_lock_directive(&language));
+        .filter(|l| !l.is_empty());
+    if let Some(language) = language_lock.as_deref() {
+        append_texts.insert(0, language_lock_directive(language));
     }
     let append_join = if append_texts.is_empty() {
         None
@@ -740,7 +775,7 @@ pub async fn build(
         // routes to it. Extension providers land AFTER the gateway so the gateway
         // stays first-match for its own ids (first-wins on a `.find`).
         models: build_models_with_extensions(resolved, &extension_session, runtime.clone()),
-        to_provider_messages: None,
+        to_provider_messages: language_lock_convert(language_lock.clone()),
         entry_projectors: Default::default(),
         agent_emitter: Some(emitter),
         // B3b loop hooks. `before_tool_call` dispatches the pi `on("tool_call")`
@@ -3050,6 +3085,39 @@ mod tests {
         assert!(!p.contains("- powershell"));
         assert!(p.contains("Bash/POSIX syntax, including on Windows"));
         assert!(p.contains("do not pass PowerShell cmdlets"));
+    }
+
+    #[tokio::test]
+    async fn language_lock_convert_appends_a_reminder_to_every_request() {
+        // The wrapper must append the reminder AFTER the default conversion:
+        // the reminder rides at the end of the provider message list, next to
+        // the generation point, every request. Unset language passes `None`
+        // through so the harness default is untouched.
+        let convert = language_lock_convert(Some("中文".to_string()));
+        let convert = convert.expect("a lock wraps the default conversion");
+        let messages = vec![rpi_agent::AgentMessage::User(rpi_ai::UserMessage::new(
+            "hello", 0,
+        ))];
+        let out = convert(messages).await;
+        let last = out.last().expect("reminder appended");
+        let rpi_ai::Message::User(user) = last else {
+            panic!("the reminder is a user message: {last:?}");
+        };
+        let text = match &user.content {
+            rpi_ai::UserContent::Text(t) => t.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("中文"), "reminder names the language: {text}");
+        assert!(
+            text.contains("think AND reply"),
+            "reminder covers thinking too: {text}"
+        );
+        assert!(
+            text.contains("never respond to it"),
+            "reminder is marked metadata: {text}"
+        );
+        assert!(out.len() >= 2, "the original messages survive");
+        assert!(language_lock_convert(None).is_none(), "no lock = default path");
     }
 
     #[test]
