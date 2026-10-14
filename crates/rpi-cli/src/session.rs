@@ -102,11 +102,13 @@ Available tools:
 - docs  — Look up rpi usage, extension, package, and compatibility documentation
 
 Guidelines:
-- Reply in the SAME language the user is writing in. Detect the language of the user's
-  latest message (and, when it is too short to be sure, the working language of the
-  conversation so far) and use it for your prose replies. Mirror it unless the user
-  explicitly asks for a different language; only fall back to English when the
-  user's language cannot be determined.
+- Think and reply in the SAME language the user is writing in — your internal
+  reasoning/thinking blocks included, not only your visible prose. Detect the
+  language of the user's latest message (and, when it is too short to be sure,
+  the working language of the conversation so far) and use it for your thinking
+  and your replies alike. Mirror it unless the user explicitly asks for a
+  different language; only fall back to English when the user's language cannot
+  be determined.
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
@@ -3027,12 +3029,18 @@ mod tests {
     fn default_prompt_instructs_language_matching() {
         // The model must detect the user's language and answer in it, so a
         // Chinese (or any non-English) user gets a same-language reply without
-        // having to ask every turn.
+        // having to ask every turn. The same rule must cover the model's
+        // thinking blocks: models default to English reasoning unless told
+        // otherwise, which reads as a language switch mid-conversation.
         let p = default_system_prompt("/tmp/proj", false);
         let lower = p.to_lowercase();
         assert!(
             lower.contains("same language") && lower.contains("detect"),
             "the prompt must tell the model to detect and mirror the user's language: {p}"
+        );
+        assert!(
+            lower.contains("think and reply") && lower.contains("reasoning/thinking"),
+            "the language rule must cover thinking blocks too: {p}"
         );
     }
 
