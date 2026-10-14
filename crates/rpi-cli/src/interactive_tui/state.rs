@@ -318,6 +318,19 @@ pub(super) struct TuiState {
     /// Display text for the `app.message.dequeue` binding (e.g. `Alt+Q`),
     /// shown in the pending-messages hint row.
     pub(super) dequeue_hint: String,
+    /// Key-thread heartbeat (unix millis, monotonic-ish via `Instant` elapsed
+    /// since an epoch captured at TUI start). Updated once per key-loop
+    /// iteration; the render-tick task checks it and dumps diagnostics when
+    /// the key thread stalls — the ask_user-freeze class of hang leaves no
+    /// other trace because the stalled thread owns all input.
+    pub(super) key_heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Epoch the heartbeat counts from — captured once at TUI start so the
+    /// counter is monotonic regardless of wall-clock changes.
+    pub(super) tui_start_instant: std::time::Instant,
+    /// One-shot guard for the key-thread hang report (see
+    /// `check_key_thread_heartbeat`); a wedged loop must not spam the log
+    /// file every tick.
+    pub(super) key_hang_reported: std::sync::atomic::AtomicBool,
     /// Last queue snapshot rendered into `pending_container`. Lets
     /// `set_pending_queue` skip redundant rebuilds + frame requests when the
     /// polled queue is unchanged.

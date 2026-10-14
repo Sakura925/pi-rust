@@ -483,6 +483,9 @@ fn test_tui_state() -> Arc<TuiState> {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -1555,6 +1558,9 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2196,6 +2202,9 @@ fn test_autocomplete_slash_suggestions_render() {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2287,6 +2296,9 @@ fn test_select_list_swap_restores_editor() {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2381,6 +2393,9 @@ fn test_message_history_browse_restores_draft() {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2478,6 +2493,9 @@ fn test_accept_top_suggestion_replaces_prefix() {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -2561,6 +2579,9 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: String::new(),
+            key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),

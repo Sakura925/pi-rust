@@ -435,6 +435,101 @@ pub(crate) fn bounded_handler_call<T: Send + 'static>(
     rx.recv_timeout(budget).ok()
 }
 
+/// Key-thread stall budget before the watchdog dumps diagnostics. Generous
+/// enough that a slow paste-burst or autocomplete refresh never trips it;
+/// short enough that a wedged lock is reported within seconds.
+const KEY_THREAD_HANG_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Watchdog: if the key loop has not heartbeated within the budget, dump a
+/// diagnostic file once (pid, elapsed, the lldb forensics command) under
+/// `~/.rpi/logs/key-thread-hang.txt` so a wedged input thread leaves evidence
+/// even when nobody is around to sample it. Runs on the render-tick task —
+/// deliberately independent of the key thread, the main loop and the render
+/// thread, so a hang in any of those cannot silence it.
+fn check_key_thread_heartbeat(state: &Arc<TuiState>) {
+    let beat = state.key_heartbeat_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if beat == 0 {
+        return; // key loop not started yet
+    }
+    let now = key_heartbeat_now(state);
+    let elapsed_ms = now.saturating_sub(beat);
+    if elapsed_ms < KEY_THREAD_HANG_BUDGET.as_millis() as u64 {
+        return;
+    }
+    // One-shot: arm the flag inside the heartbeat field by storing a sentinel
+    // so a wedged loop cannot re-trigger (and a recovered loop resets it).
+    if state
+        .key_hang_reported
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let pid = std::process::id();
+    let report = format!(
+        "rpi key-thread hang detected at {}\n  pid: {pid}\n  stalled for: {} ms (no key-loop heartbeat)\n  symptoms: input dead, dialogs dead, Ctrl+C dead — the key thread is wedged on a lock.\n  forensics (run before killing):\n    lldb -p {pid} -o 'process attach' -o 'thread backtrace all' -o 'detach' -b > lldb-bt.txt 2>&1\n    sample {pid} 2 -file hang.sample\n  then: kill -INT {pid}\n  attach the files to the bug report.\n\n",
+        chrono_like_utc(),
+        elapsed_ms
+    );
+    let path = key_hang_report_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, report.as_bytes()));
+    tracing::error!(
+        "key thread stalled for {elapsed_ms}ms — diagnostics written to {}",
+        path.display()
+    );
+}
+
+fn key_heartbeat_now(state: &Arc<TuiState>) -> u64 {
+    state
+        .tui_start_instant
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn key_hang_report_path() -> std::path::PathBuf {
+    let root = std::env::var_os("RPI_CODING_AGENT_DIR")
+        .and_then(|agent| std::path::PathBuf::from(agent).parent().map(|p| p.to_path_buf()))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".rpi")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    root.join("logs").join("key-thread-hang.txt")
+}
+
+fn chrono_like_utc() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map(|secs| {
+            // RFC-3339-ish without a chrono dependency: civil-from-days
+            // (Howard Hinnant's algorithm).
+            let days = secs / 86400;
+            let secs_of_day = secs % 86400;
+            let (y, m, d) = civil_from_days(days as i64);
+            format!(
+                "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+                secs_of_day / 3600,
+                (secs_of_day / 60) % 60,
+                secs_of_day % 60
+            )
+        })
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = era * 400 + yoe as i64 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
 /// Canonical key name for a key event, matching the vocabulary
 /// [`parse_configured_key`] accepts (`"space"`, `"enter"`, `"f1"`, `"a"`).
 /// `None` for keys that cannot be named (media keys, unknown codes).
@@ -1279,6 +1374,9 @@ pub async fn interactive_tui(
         search_bar: Arc::new(SearchBar::new()),
         pending_container: Arc::new(Container::new()),
         dequeue_hint: pending_dequeue_hint(&keybindings),
+        key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            tui_start_instant: std::time::Instant::now(),
+            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -1618,6 +1716,12 @@ pub async fn interactive_tui(
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;
+            // Key-thread watchdog: the key loop heartbeats once per iteration;
+            // a stall longer than the budget means the thread is wedged on a
+            // lock (the ask_user-freeze class of hang: input dead, dialogs
+            // dead, Ctrl+C dead). Dump diagnostics once so the next hang
+            // leaves evidence even when nobody is around to sample it.
+            check_key_thread_heartbeat(&state_tick);
             // Extension status (langfuse ✓ …, …) — cheap revision check, and the
             // only reason an idle session repaints its footer.
             let panels_changed = plugin_panels.sync(tui_tick.as_ref(), &state_tick.ext_status);
@@ -1709,6 +1813,15 @@ pub async fn interactive_tui(
             ));
         }
         loop {
+            // Heartbeat: the render-tick watchdog checks this every tick; a
+            // wedged lock below stalls it and triggers a diagnostic dump.
+            state_for_key.key_heartbeat_ms.store(
+                state_for_key
+                    .tui_start_instant
+                    .elapsed()
+                    .as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if !*running_key.lock().unwrap() {
                 break;
             }
