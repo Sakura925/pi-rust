@@ -1271,18 +1271,51 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
 /// history, so a later recovery must find nothing to salvage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_completed_run_leaves_no_frames_to_salvage() {
-    let script = FauxScript::new().with_text("all done");
+    // Stream slowly enough to observe the frames while the run is in flight:
+    // they are only resident until the run's clear-run marker retires them.
+    let script = FauxScript::new()
+        .with_tokens_per_second(50.0)
+        .with_text("the quick brown fox jumps over the lazy dog ".repeat(4));
     let (harness, _provider, _env) = harness_with(script).await;
 
-    let result = harness
-        .prompt_text("finish cleanly", vec![])
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("finish cleanly", vec![]).await })
+    };
+
+    // While the run is open, its frames are resident in memory.
+    let session = harness.session().clone();
+    let mut in_flight = 0usize;
+    for _ in 0..200 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        in_flight = records.len();
+        if in_flight >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        in_flight >= 3,
+        "frames were recorded while the run was in flight, saw {in_flight}"
+    );
+
+    let result = run
         .await
+        .expect("the run task finished")
         .expect("prompt completes");
     assert!(matches!(
         result.outcome,
         HarnessRunOutcome::Completed { .. }
     ));
 
+    // The run's clear-run marker retired those frames from memory: they were
+    // progress, not history, so a later query finds nothing left over ...
     let records = harness
         .session()
         .find_records(&RecordQuery {
@@ -1292,10 +1325,11 @@ async fn a_completed_run_leaves_no_frames_to_salvage() {
         .await
         .expect("frame records readable");
     assert!(
-        !records.is_empty(),
-        "frames were recorded while the run was in flight"
+        records.is_empty(),
+        "a completed run's frames are retired from memory on clear-run"
     );
 
+    // ... and a later recovery must not salvage the committed run either.
     let salvaged =
         rpi_harness::frame_progress::salvage_run_frames(harness.session(), &result.run_id)
             .await

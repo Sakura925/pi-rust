@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SessionError, SessionResult};
 use crate::session::types::{
-    BranchBounds, Entry, EntryOrder, EntryQuery, ForkOptions, ForkPosition, LanePointer,
-    LaneRecord, LogItem, LogOptions, OperationStartedRecord, RecordQuery, SessionMetadata,
-    SessionMutation, SessionStats,
+    AssistantFrameOp, BranchBounds, Entry, EntryOrder, EntryQuery, ForkOptions, ForkPosition,
+    LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord, RecordQuery,
+    SessionMetadata, SessionMutation, SessionStats,
 };
 
 /// The in-memory mutation reducer. Mirrors TS `SessionState`. Owns the
@@ -243,6 +243,41 @@ impl SessionState {
                         usage_rec.usage.input + usage_rec.usage.cache_write;
                     self.stats.total_tokens += usage_rec.usage.total_tokens;
                     self.stats.cost_total += usage_rec.usage.cost.total;
+                }
+                // Frames are streaming progress, not history: the disk record
+                // log is their authoritative store (crash salvage re-reads it on
+                // the next load), so memory must not retain a finished run's
+                // frames. Retaining them doubled every frame as a live
+                // allocation (`records` + `log`), and a load replay of a long
+                // session parked the *whole* history of frames in memory —
+                // ~140 MB resident for a 25 MB session (measured 2026-10-13).
+                //
+                // The run's `clear_run` marker is the retire signal. Replaying a
+                // file streams frames through memory per run (push frames, hit
+                // clear_run, drop them again), so peak resident stays at one
+                // run's frames instead of the whole log. An *open* run (crash
+                // before clear_run) keeps its frames in `records` so the load-
+                // path salvage (`replay_run_frames`) still finds them.
+                if let LaneRecord::AssistantFrame(frame) = &record {
+                    if frame.op == AssistantFrameOp::ClearRun {
+                        let run_id = frame.run_id.clone();
+                        self.records
+                            .retain(|r| !matches!(r, LaneRecord::AssistantFrame(f) if f.run_id == run_id));
+                        self.log.retain(|i| {
+                            !matches!(
+                                i,
+                                LogItem::Record {
+                                    record: LaneRecord::AssistantFrame(f),
+                                    ..
+                                } if f.run_id == run_id
+                            )
+                        });
+                        // The clear-run marker itself is progress too: do not
+                        // retain it. Sequence advancement below still runs, so
+                        // append-only file layout and seq bookkeeping are intact.
+                        self.used_ids.insert(record.id().to_string());
+                        return Ok(ApplyOutcome::Record(record));
+                    }
                 }
                 self.records.push(record.clone());
                 self.log.push(LogItem::Record {

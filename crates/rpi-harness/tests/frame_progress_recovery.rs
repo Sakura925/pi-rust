@@ -233,12 +233,28 @@ async fn a_cleared_run_salvages_nothing_from_disk() {
         .await
         .expect("append clear");
 
-    let reloaded = JsonlSessionStorage::load(fs, PATH, clock(), ids())
+    let reloaded = JsonlSessionStorage::load(fs.clone(), PATH, clock(), ids())
         .await
         .expect("reload jsonl session");
     let session = Session::new(Arc::new(reloaded), None);
 
-    // The frames are still readable...
+    // The frames + clear marker are still on disk (the record log is their
+    // authoritative store) ...
+    let on_disk = fs
+        .read_text_file(PATH, None)
+        .await
+        .expect("session file readable");
+    let frame_lines = on_disk
+        .lines()
+        .filter(|l| l.contains("\"type\":\"assistant_frame\""))
+        .count();
+    assert_eq!(
+        frame_lines, 4,
+        "frames + the clear marker are all on disk"
+    );
+
+    // ... but a finished run's frames no longer sit in memory (retired on
+    // clear-run), so the in-memory query finds nothing ...
     let records = session
         .find_records(&RecordQuery {
             record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
@@ -249,8 +265,8 @@ async fn a_cleared_run_salvages_nothing_from_disk() {
         .expect("records readable");
     assert_eq!(
         records.len(),
-        4,
-        "frames + the clear marker are all on disk"
+        0,
+        "a finished run's frames are retired from memory on reload"
     );
 
     // ...but nothing is salvaged, so a committed run is never duplicated.
