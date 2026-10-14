@@ -2942,3 +2942,33 @@ fn ask_user_bridge_answers_and_cancels_by_request_id() {
         }))
         .is_err());
 }
+
+/// A stalled extension handler must never wedge the UI thread: the bounded
+/// dispatch returns `None` after the budget and the caller moves on (the
+/// detached thread finishes on its own). This is the regression guard for the
+/// ask_user freeze — a bridge extension synchronously `wait()`ing on a hung
+/// child process used to block the key thread forever while it held the
+/// extension-session lock, freezing dialogs, input and Ctrl+C alike.
+#[test]
+fn bounded_handler_call_times_out_on_stalled_handler() {
+    let started = std::time::Instant::now();
+    let result = bounded_handler_call(std::time::Duration::from_millis(100), || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        "late"
+    });
+    let elapsed = started.elapsed();
+    assert!(result.is_none(), "stalled handler must time out");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "returned within budget (+ scheduling slack), took {elapsed:?}"
+    );
+}
+
+#[test]
+fn bounded_handler_call_passes_through_fast_handlers() {
+    let result = bounded_handler_call(std::time::Duration::from_millis(500), || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        "done"
+    });
+    assert_eq!(result.as_deref(), Some("done"));
+}

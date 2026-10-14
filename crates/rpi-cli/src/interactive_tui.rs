@@ -360,25 +360,79 @@ impl CommandRegistry {
 }
 
 /// Dispatch a ui_prompt_start event to extensions.
+///
+/// The session lock only guards the O(1) `Arc` snapshot clone; the fan-out
+/// itself runs **outside the lock** with a bounded wait. An extension handler
+/// that stalls (e.g. a bridge synchronously `wait()`ing on a hung child
+/// process) must never freeze the key thread — it used to, taking the whole
+/// TUI down with it (input, dialogs, ask_user rendering all share this thread).
+/// On timeout the detached handler thread keeps running until it finishes on
+/// its own (the captured snapshot `Arc` keeps the plugin libraries alive), and
+/// the caller moves on.
 fn dispatch_ui_prompt_event(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    if let Ok(session) = state.extension_session.lock() {
-        if let Some(snapshot) = session.snapshot_arc() {
-            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
-        }
-    }
+    let snapshot = session_snapshot_bounded(state, EventTag::UiPromptStart);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    bounded_handler_call(UI_EVENT_DISPATCH_BUDGET, move || {
+        rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
+    });
 }
 
-/// Dispatch a ui_prompt_end event to extensions.
+/// Dispatch a ui_prompt_end event to extensions. Same lock-free, bounded
+/// contract as [`dispatch_ui_prompt_event`].
 fn dispatch_ui_prompt_event_end(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    if let Ok(session) = state.extension_session.lock() {
-        if let Some(snapshot) = session.snapshot_arc() {
-            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
-        }
+    let snapshot = session_snapshot_bounded(state, EventTag::UiPromptEnd);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    bounded_handler_call(UI_EVENT_DISPATCH_BUDGET, move || {
+        rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
+    });
+}
+
+/// Upper bound a UI-thread extension fan-out may block the key thread. Prompt
+/// events fire on every selector/dialog open+close (ask_user included); the
+/// budget trades a worst-case visible hiccup for never wedging input forever.
+pub(crate) const UI_EVENT_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Upper bound an extension key-claim may block the key thread before the key
+/// degrades to its normal editor routing. Tighter than the prompt budget:
+/// this sits on every keystroke while an extension subscribes to `Input`.
+const INPUT_CLAIM_DISPATCH_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(150);
+
+/// Snapshot the extension registry with the session lock held only for the
+/// `Arc` clone, skipping the dispatch entirely when no handler subscribes to
+/// `tag` (the common case must pay neither a thread spawn nor a wait).
+fn session_snapshot_bounded(
+    state: &TuiState,
+    tag: rpi_plugin_sdk::EventTag,
+) -> Option<Arc<rpi_extensions::RegistrySnapshot>> {
+    let session = state.extension_session.lock().ok()?;
+    let snapshot = session.snapshot_arc()?;
+    if snapshot.handlers_for(tag).is_empty() {
+        return None;
     }
+    Some(snapshot)
+}
+
+/// Run `f` on a detached thread and wait at most `budget`. Returns `None` on
+/// timeout — the thread is left to finish on its own (it must not depend on
+/// locks the caller holds; every call site here dispatches lock-free).
+pub(crate) fn bounded_handler_call<T: Send + 'static>(
+    budget: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel::<T>();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(budget).ok()
 }
 
 /// Canonical key name for a key event, matching the vocabulary
@@ -452,16 +506,23 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
         return false;
     };
 
-    let Ok(session) = state.extension_session.lock() else {
-        return false;
+    // Snapshot + cheap pre-checks under the session lock (no handler runs
+    // while it is held); the claiming dispatch itself runs outside the lock
+    // with a bounded wait so a stalled extension can never wedge the key
+    // thread — a timeout degrades the key to its normal editor routing.
+    let snapshot = {
+        let Ok(session) = state.extension_session.lock() else {
+            return false;
+        };
+        let Some(snapshot) = session.snapshot_arc() else {
+            return false;
+        };
+        // Nothing claimed this key (or nobody subscribes to Input) — not ours.
+        if !snapshot.has_shortcut(&name) || snapshot.handlers_for(EventTag::Input).is_empty() {
+            return false;
+        }
+        snapshot
     };
-    let Some(snapshot) = session.snapshot_arc() else {
-        return false;
-    };
-    // Nothing claimed this key (or nobody subscribes to Input) — not ours.
-    if !snapshot.has_shortcut(&name) || snapshot.handlers_for(EventTag::Input).is_empty() {
-        return false;
-    }
     // Function keys do not insert text. Other keys belong to the draft editor
     // while composing (space especially).
     if !owned_release && !editor.get_text().is_empty() && !matches!(key.code, KeyCode::F(_)) {
@@ -485,9 +546,20 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     // The handler decides whether it actually wants the key: it returns the
     // `CLAIMED` code while its feature is active and `CONTINUE` otherwise, so a
     // registered-but-disabled shortcut (push-to-talk toggled off) still lets the
-    // key reach the editor normally.
-    let claimed =
-        rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload);
+    // key reach the editor normally. A stalled handler times out as
+    // not-claimed; its detached thread finishes on its own (snapshot `Arc` in
+    // its closure keeps the plugin libraries alive until then).
+    let claimed = bounded_handler_call(INPUT_CLAIM_DISPATCH_BUDGET, {
+        let payload = payload.clone();
+        move || {
+            rpi_extensions::dispatch_data_event_claiming(
+                &snapshot,
+                EventTag::Input,
+                &payload,
+            )
+        }
+    })
+    .unwrap_or(false);
     if claimed && key.kind == KeyEventKind::Press {
         state
             .extension_claimed_keys

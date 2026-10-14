@@ -1152,20 +1152,32 @@ impl TuiState {
             return;
         };
         // Cheap pre-check so the common (no subscriber) case never touches a
-        // plugin: session lock + snapshot read only.
-        let Ok(session) = self.extension_session.lock() else {
-            return;
+        // plugin: session lock + snapshot read only. The lock guards the O(1)
+        // `Arc` clone — the fan-out runs outside it, bounded, so a stalled
+        // extension handler can never wedge the UI tick (this runs on the main
+        // loop; a wedged tick freezes rendering and message handling).
+        let snapshot = {
+            let Ok(session) = self.extension_session.lock() else {
+                return;
+            };
+            let Some(snapshot) = session.snapshot_arc() else {
+                return;
+            };
+            if snapshot.handlers_for(EventTag::EditorChange).is_empty() {
+                return;
+            }
+            snapshot
         };
-        let Some(snapshot) = session.snapshot_arc() else {
-            return;
-        };
-        if snapshot.handlers_for(EventTag::EditorChange).is_empty() {
-            return;
-        }
-        rpi_extensions::dispatch_data_event(
-            &snapshot,
-            EventTag::EditorChange,
-            &payload.to_string(),
+        let snapshot = std::sync::Arc::clone(&snapshot);
+        crate::interactive_tui::bounded_handler_call(
+            crate::interactive_tui::UI_EVENT_DISPATCH_BUDGET,
+            move || {
+                rpi_extensions::dispatch_data_event(
+                    &snapshot,
+                    EventTag::EditorChange,
+                    &payload.to_string(),
+                );
+            },
         );
     }
 
