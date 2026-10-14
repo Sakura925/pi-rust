@@ -225,8 +225,14 @@ pub(super) fn open_extension_input(
     frame.add_child(Arc::new(Spacer::new(1)));
     frame.add_child(Arc::new(DynamicBorder::new()));
 
-    *ctx.state.active_extension_editor.lock().unwrap() = None;
-    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
+    // try_lock: key thread must never block on the dialog-lifecycle slots
+    // (see close_extension_editor — the fourth hang froze input exactly here).
+    if let Ok(mut slot) = ctx.state.active_extension_editor.try_lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = ctx.state.active_extension_input.try_lock() {
+        *slot = Some(input.clone());
+    }
     ctx.editor_container.clear();
     ctx.editor_container.add_child(frame);
 
@@ -445,8 +451,13 @@ pub(super) fn open_extension_editor(
     frame.add_child(Arc::new(Spacer::new(1)));
     frame.add_child(Arc::new(DynamicBorder::new()));
 
-    *ctx.state.active_extension_editor.lock().unwrap() = Some(editor.clone());
-    *ctx.state.active_extension_input.lock().unwrap() = None;
+    // try_lock: see close_extension_editor — the key thread never blocks.
+    if let Ok(mut slot) = ctx.state.active_extension_editor.try_lock() {
+        *slot = Some(editor.clone());
+    }
+    if let Ok(mut slot) = ctx.state.active_extension_input.try_lock() {
+        *slot = None;
+    }
     ctx.editor_container.clear();
     ctx.editor_container.add_child(frame);
 
@@ -509,9 +520,22 @@ pub(super) fn close_extension_editor(
     editor_container.clear();
     editor_container.add_child(editor.clone());
     state.autocomplete_container.clear();
-    *state.active_extension_editor.lock().unwrap() = None;
-    *state.active_extension_input.lock().unwrap() = None;
-    *state.active_extension_cancel.lock().unwrap() = None;
+    // The dialog-lifecycle slots use `try_lock`: this runs on the key thread,
+    // which must NEVER block on these state locks. Any holder that stalls
+    // (a wedged extension UI flow on a worker, a double-unlock orphaning the
+    // mutex — the fourth hang left the key thread dead on exactly this lock
+    // with no owner anywhere in the process) would otherwise freeze input,
+    // dialogs and Ctrl+C all at once. A busy lock degrades to "skip the
+    // cleanup this pass" — the dialog state reconciles on a later event.
+    if let Ok(mut slot) = state.active_extension_editor.try_lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = state.active_extension_input.try_lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = state.active_extension_cancel.try_lock() {
+        *slot = None;
+    }
     editor.set_focused(true);
     tui.set_focus(Some(editor.clone()));
     tui.request_render(false);
@@ -899,8 +923,14 @@ pub(super) fn open_ask_user_input(
     input.set_focused(true);
 
     let frame = ask_user_frame(&prompt, input.clone(), "Enter submit · Esc cancel");
-    *ctx.state.active_extension_editor.lock().unwrap() = None;
-    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
+    // try_lock: key thread must never block on the dialog-lifecycle slots
+    // (see close_extension_editor — the fourth hang froze input exactly here).
+    if let Ok(mut slot) = ctx.state.active_extension_editor.try_lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = ctx.state.active_extension_input.try_lock() {
+        *slot = Some(input.clone());
+    }
     ctx.editor_container.clear();
     ctx.editor_container.add_child(frame);
     ctx.tui.set_focus(Some(input.clone()));
