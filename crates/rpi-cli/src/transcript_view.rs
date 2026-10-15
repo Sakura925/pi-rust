@@ -380,6 +380,10 @@ impl TranscriptView {
                 if !display.trim().is_empty() && display.trim() != "{}" {
                     existing.set_args(&display);
                 }
+                // Panels born from the streaming path (AssistantUpdate) can
+                // predate ToolExecutionStart; make sure the delegate identity
+                // is applied as soon as the args carry it.
+                apply_delegate_info(existing, &call.name, &call.args);
             } else {
                 let comp = Arc::new(ToolExecutionComponent::new(&call.name, &display));
                 if ask_user {
@@ -388,6 +392,7 @@ impl TranscriptView {
                 if let Some(skill) = skill_tool_name(&call.name, &call.args) {
                     comp.set_skill_name(skill);
                 }
+                apply_delegate_info(&comp, &call.name, &call.args);
                 comp.set_expanded(self.expanded());
                 comp.set_running();
                 self.chat.add_child(comp.clone());
@@ -433,6 +438,10 @@ impl TranscriptView {
                 existing.set_display_title("ASK USER");
             }
             existing.set_args(&display);
+            // Panels born from the streaming path (AssistantUpdate) can
+            // reach here before any delegate identity was applied — set it
+            // now that the finalized args are available.
+            apply_delegate_info(existing, name, args);
         } else {
             let comp = Arc::new(ToolExecutionComponent::new(name, &display));
             if ask_user {
