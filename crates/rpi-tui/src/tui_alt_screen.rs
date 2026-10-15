@@ -617,6 +617,19 @@ impl TuiAltScreen {
         self.set_render_suspended(false);
     }
 
+    /// True when both rows render as pure whitespace (ignoring ANSI styling
+    /// and OSC 8 hyperlink escapes): repainting between them has no visible
+    /// effect beyond style tails.
+    fn blank_row_pair(old: Option<&String>, new: Option<&String>) -> bool {
+        match (old, new) {
+            (Some(old), Some(new)) => {
+                crate::ansi::strip_ansi(old).trim().is_empty()
+                    && crate::ansi::strip_ansi(new).trim().is_empty()
+            }
+            _ => false,
+        }
+    }
+
     /// Render the complete component tree into the main terminal buffer. This
     /// follows upstream's regular-mode strategy: append growth with CRLF so
     /// the terminal creates real scrollback, and rewrite only the changed tail.
@@ -705,6 +718,7 @@ impl TuiAltScreen {
                 };
                 let mut output = String::from("\x1b[?2026h");
                 let mut force_tail_repaint = false;
+                let mut healed = false;
                 if move_target < viewport_top {
                     // The changed range starts above the visible viewport (e.g.
                     // a long streamed message re-wrapping above the visible
@@ -725,17 +739,36 @@ impl TuiAltScreen {
                     viewport_top = move_target;
                     hardware_row = move_target;
                 } else if move_target > viewport_bottom {
-                    let current_screen = hardware_row
-                        .saturating_sub(viewport_top)
-                        .min(height.saturating_sub(1));
-                    let down = height.saturating_sub(1).saturating_sub(current_screen);
-                    if down > 0 {
-                        output.push_str(&format!("\x1b[{down}B"));
-                    }
                     let scroll = move_target - viewport_bottom;
-                    output.push_str(&"\r\n".repeat(scroll));
-                    viewport_top += scroll;
-                    hardware_row = move_target;
+                    if scroll > height {
+                        // Self-heal a runaway scroll. A `scroll` larger than a
+                        // full screen means the viewport tracking drifted from
+                        // the real terminal (foreign output while suspended,
+                        // size churn, or a state reset). Replaying `\r\n` per
+                        // row would blank the visible viewport while the real
+                        // content only lives on in the scrollback, so repaint
+                        // the whole document instead and resynchronize the
+                        // tracked viewport.
+                        output.push_str("\x1b[?2026l");
+                        output.push_str("\x1b[?2026h");
+                        output.push_str(&lines.join("\r\n"));
+                        output.push_str("\x1b[?2026l");
+                        hardware_row = lines.len().saturating_sub(1);
+                        viewport_top = lines.len().saturating_sub(height);
+                        healed = true;
+                    } else {
+                        let current_screen = hardware_row
+                            .saturating_sub(viewport_top)
+                            .min(height.saturating_sub(1));
+                        let down =
+                            height.saturating_sub(1).saturating_sub(current_screen);
+                        if down > 0 {
+                            output.push_str(&format!("\x1b[{down}B"));
+                        }
+                        output.push_str(&"\r\n".repeat(scroll));
+                        viewport_top += scroll;
+                        hardware_row = move_target;
+                    }
                 }
                 let current_screen = hardware_row.saturating_sub(viewport_top);
                 let target_screen = move_target.saturating_sub(viewport_top);
@@ -749,10 +782,18 @@ impl TuiAltScreen {
                 if force_tail_repaint {
                     render_end = lines.len().saturating_sub(1);
                 }
-                if !deleted_tail_only {
+                if !deleted_tail_only && !healed {
                     for index in first..=render_end {
                         if index > first {
                             output.push_str("\r\n");
+                        }
+                        // Blank-vs-blank rows carry no visible content: the
+                        // only diff between them is a style tail. Emitting a
+                        // column jump plus resets for each such row is pure
+                        // noise in the output byte stream, so keep the row
+                        // structure but write no content.
+                        if Self::blank_row_pair(previous.get(index), lines.get(index)) {
+                            continue;
                         }
                         if let Some((column, text)) = previous
                             .get(index)
@@ -773,7 +814,9 @@ impl TuiAltScreen {
                     }
                 }
                 let mut final_row = render_end;
-                if previous.len() > lines.len() {
+                if healed {
+                    final_row = lines.len().saturating_sub(1);
+                } else if previous.len() > lines.len() {
                     let extra_lines = previous.len() - lines.len();
                     let clear_start_offset = usize::from(!lines.is_empty());
                     if clear_start_offset > 0 {
@@ -1700,6 +1743,96 @@ mod tests {
         tui.set_render_suspended(false);
         tui.set_layout_root(Some(Arc::new(Text::new("new frame", 0, 0))));
         assert!(output.lock().unwrap().len() > before);
+    }
+
+    struct StaticLines(Arc<Mutex<Vec<String>>>);
+
+    impl Component for StaticLines {
+        fn render(&self, _width: usize) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn regular_mode_heals_runaway_scrolls_with_full_repaint() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new(
+            &(0..60)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        tui.do_render(false);
+        output.lock().unwrap().clear();
+
+        // 模拟视口跟踪漂移（外部输出 / 挂起渲染 / 尺寸抖动后的状态失真）：
+        // 跟踪状态以为视口还在文档顶部，真实终端已在底部。
+        *tui.main_viewport_top.lock().unwrap() = 0;
+        *tui.main_hardware_row.lock().unwrap() = 0;
+
+        // 追加一行新内容：文档 60 → 61 行。
+        content.set_text(
+            &(0..60)
+                .map(|i| format!("line {i}"))
+                .chain(std::iter::once("new tail".to_string()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        tui.do_render(false);
+
+        let frame = output.lock().unwrap().clone();
+        // 自愈路径：全量重发正文（而非 52 个字面 \r\n 的洪水滚动）。
+        assert!(frame.contains("line 0"));
+        assert!(frame.contains("new tail"));
+        assert!(!frame.contains(&"\r\n".repeat(8)));
+        // 自愈后视口跟踪重新同步到文档底部。
+        assert_eq!(*tui.main_viewport_top.lock().unwrap(), 61 - 8);
+        tui.stop(Default::default());
+    }
+
+    #[test]
+    fn regular_mode_skips_blank_row_style_diffs() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let lines = Arc::new(Mutex::new(vec![
+            "hello".to_string(),
+            format!("{}\x1b[31m", " ".repeat(40)),
+        ]));
+        let content = Arc::new(StaticLines(lines.clone()));
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content));
+        tui.start_readerless();
+        tui.do_render(false);
+        output.lock().unwrap().clear();
+
+        // 第二行仍是 40 列空白，只有样式尾巴变化（典型 markdown 空行重置）。
+        *lines.lock().unwrap() = vec![
+            "hello".to_string(),
+            format!("{}\x1b[32m", " ".repeat(40)),
+        ];
+        tui.do_render(false);
+
+        let frame = output.lock().unwrap().clone();
+        // 空白行样式 diff 被剪枝：不产生“跳列 + 无文本”帧字节。
+        assert!(!frame.contains("\x1b[40C"));
+        assert!(!frame.contains("\x1b[32m"));
+        tui.stop(Default::default());
     }
 
     #[test]
