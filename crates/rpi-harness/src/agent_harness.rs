@@ -3841,7 +3841,12 @@ impl AgentHarness {
                             if !should_compact(tokens, model.context_window as i64, &settings) {
                                 return None;
                             }
-                            let entries: Vec<Entry> = context.messages.iter().enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
+                            // Reminders are transient (never persisted): they
+                            // live in the loop context only, so a mid-run
+                            // compaction must not carry one into entries/retained
+                            // tail. Filter them BEFORE building the runtime
+                            // entries — see `working_state::is_reminder_message`.
+                            let entries: Vec<Entry> = context.messages.iter().filter(|message| !crate::working_state::is_reminder_message(message)).enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
                                 base: crate::session::types::EntryBase { entry_type: "message".into(), id: format!("runtime-{i}"), seq: i as u64 + 1, parent_id: None, timestamp: i as i64 },
                                 message: message.clone(), terminate: None,
                             })).collect();
@@ -4104,19 +4109,30 @@ impl AgentHarness {
                 // whole run future non-`Send`.
                 let budget_stop = run_budget.lock().unwrap().stop();
                 if let Some(stop) = budget_stop {
+                    // Event contract for the handoff: the loop has already
+                    // emitted its AgentEnd, but the run is NOT over — the
+                    // bounded summary call below can hold the lane for up to
+                    // HANDOFF_TIMEOUT. Re-enter the Working state for its
+                    // duration (AgentStart) and close it AFTER the truncation
+                    // notice is durable, so consumers that stop on AgentEnd
+                    // (TUI idle, remote drains) see the handoff and the notice
+                    // before the run truly ends.
+                    base_emitter.emit(AgentEvent::AgentStart).await;
+                    let mut handoff_for_agent_end: Vec<AgentMessage> = Vec::new();
+
                     // Bounded handoff: before the deterministic truncation
                     // notice, give the model ONE last tool-free, output-capped
                     // summary call so the transcript ends with "done / remains /
                     // next step" instead of a bare cut. Best effort by design:
                     // any failure (no provider, aborted, provider error, empty
-                    // reply) falls through to the notice below, which is the
-                    // guaranteed backstop. See `budget_handoff_summary`.
+                    // reply, deadline) falls through to the notice below, which
+                    // is the guaranteed backstop. See `budget_handoff_summary`.
                     if let Some(summary) = self
                         .budget_handoff_summary(
                             &stop,
                             &snap.model,
                             &snap.models,
-                            &new_messages[start..],
+                            &build_opts,
                             &signal,
                         )
                         .await
@@ -4141,9 +4157,10 @@ impl AgentHarness {
                                     .await;
                                 base_emitter
                                     .emit(AgentEvent::MessageEnd {
-                                        message: agent_message,
+                                        message: agent_message.clone(),
                                     })
                                     .await;
+                                handoff_for_agent_end = vec![agent_message];
                             }
                             Err(error) => tracing::warn!(
                                 lane = %self.lane,
@@ -4166,6 +4183,13 @@ impl AgentHarness {
                             "could not record the run-budget stop notice"
                         );
                     }
+                    // Close the handoff's Working state (see the AgentStart
+                    // above) only after the notice is durable.
+                    base_emitter
+                        .emit(AgentEvent::AgentEnd {
+                            messages: handoff_for_agent_end,
+                        })
+                        .await;
                 }
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
                 // The run's messages are durable now, so its frames are no
@@ -4294,21 +4318,28 @@ impl AgentHarness {
     /// (done / remains / next step). Persists nothing and emits nothing — the
     /// caller appends the returned message and emits it through the raw
     /// emitter. Returns `None` on any failure (no provider, cancelled signal,
-    /// provider error/abort, empty reply): the deterministic `runBudget`
-    /// notice is the backstop, so a failed handoff must never extend the run
-    /// or surface as a second error.
+    /// provider error/abort, empty reply, deadline): the deterministic
+    /// `runBudget` notice is the backstop, so a failed handoff must never
+    /// extend the run or surface as a second error.
     ///
-    /// Context is rebuilt from the durable branch path plus this run's
-    /// not-yet-persisted messages (`run_messages` = `new_messages[cut..]`),
-    /// which mirrors what the *next* run will see after persistence — a
-    /// mid-run compaction cut is respected rather than replaying the
-    /// compacted turns.
+    /// Context: the caller invokes this AFTER `persist_new_messages`, so the
+    /// durable branch path already contains this run's messages. It is rebuilt
+    /// with `build_session_context` + the same `build_opts` the next run will
+    /// use — compaction boundaries, branch summaries and entry projectors are
+    /// all applied, so the summary request sees exactly the next run's view
+    /// (no duplicated run messages, no pre-compaction history).
+    ///
+    /// Deadline: `HANDOFF_TIMEOUT` bounds the future at the harness level
+    /// (tokio timeout) in addition to the provider-level `options.timeout` —
+    /// a provider that ignores the option must not hold the run open. The
+    /// abandoned provider task is detached, which is the same failure shape
+    /// as an aborted stream.
     async fn budget_handoff_summary(
         &self,
         stop: &crate::run_budget::BudgetStop,
         model: &Model,
         providers: &[Arc<dyn AiProvider>],
-        run_messages: &[AgentMessage],
+        build_opts: &SessionContextBuildOptions,
         signal: &CancellationToken,
     ) -> Option<AssistantMessage> {
         if signal.is_cancelled() {
@@ -4318,21 +4349,14 @@ impl AgentHarness {
             .map_err(|error| tracing::warn!(%error, "budget handoff: no provider"))
             .ok()?;
 
+        // The run's messages are durable by now, and build_session_context
+        // applies the same compaction/projector view the next run gets.
         let path = self
             .branch_path_oldest_first()
             .await
             .map_err(|error| tracing::warn!(%error, "budget handoff: could not rebuild branch path"))
             .ok()?;
-        let mut messages: Vec<AgentMessage> = path
-            .into_iter()
-            .filter_map(|entry| match entry {
-                crate::session::types::Entry::Message(message_entry) => {
-                    Some(message_entry.message)
-                }
-                _ => None,
-            })
-            .collect();
-        messages.extend(run_messages.iter().cloned());
+        let mut messages: Vec<AgentMessage> = build_session_context(&path, build_opts).messages;
 
         let (turns, limit) = match stop {
             crate::run_budget::BudgetStop::TurnLimit { turns, limit } => (*turns, *limit),
@@ -4363,11 +4387,27 @@ impl AgentHarness {
             max_tokens: Some(HANDOFF_MAX_TOKENS),
             signal: signal.clone(),
             // Standalone request: no retry (the notice below is the
-            // backstop), no cache write, thinking disabled.
+            // backstop) and no cache write. Note: `reasoning: None` merely
+            // omits the effort parameter on the completions path — it is NOT
+            // a guaranteed server-side thinking switch; the `max_tokens` cap
+            // is the real bound on this call.
             ..Default::default()
         };
-        let response =
-            complete_simple_with_retries(provider, model.clone(), context, options, None).await;
+        let response = match tokio::time::timeout(
+            HANDOFF_TIMEOUT,
+            complete_simple_with_retries(provider, model.clone(), context, options, None),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = HANDOFF_TIMEOUT.as_secs(),
+                    "budget handoff summary timed out; keeping the truncation notice"
+                );
+                return None;
+            }
+        };
         if matches!(response.stop_reason, StopReason::Error | StopReason::Aborted) {
             tracing::warn!(
                 reason = ?response.stop_reason,

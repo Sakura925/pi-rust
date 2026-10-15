@@ -973,7 +973,9 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
     let mut steps: Vec<FauxStep> = (0..ceiling).map(|_| step()).collect();
     steps.push(FauxStep::text("handoff: completed A; remains B; next C"));
     script.set_responses(steps);
-    let (harness, provider, _env) = harness_with(script).await;
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, provider, _env) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
 
     let result = harness
         .prompt_text("loop until the budget stops you", vec![])
@@ -1089,6 +1091,47 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         "a handoff summary must be persisted before the budget notice; \
          handoff at {handoff_position:?}, notice at {notice_position:?}"
     );
+
+    // Event contract: the loop emits ITS AgentEnd when it stops, but the run
+    // is not over — the handoff re-enters Working (AgentStart) and only the
+    // final AgentEnd, carrying the handoff message, closes it. Consumers that
+    // stop on AgentEnd must therefore see the handoff first.
+    let events = events.lock().unwrap();
+    let agent_end_positions: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, AgentEvent::AgentEnd { .. }).then_some(index)
+        })
+        .collect();
+    assert!(
+        agent_end_positions.len() >= 2,
+        "expected the loop's AgentEnd + the handoff's AgentEnd, got {} ends",
+        agent_end_positions.len()
+    );
+    let first_end = agent_end_positions[0];
+    let last_end = *agent_end_positions.last().unwrap();
+    let between = &events[first_end + 1..last_end];
+    assert!(
+        between
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentStart)),
+        "the handoff must re-enter Working (AgentStart) after the loop's AgentEnd"
+    );
+    match &events[last_end] {
+        AgentEvent::AgentEnd { messages } => assert!(
+            messages.iter().any(|message| match message {
+                AgentMessage::Assistant(assistant) => rpi_ai::types::Content::text_only(
+                    &assistant.content,
+                    "\n",
+                )
+                .contains("handoff: completed"),
+                _ => false,
+            }),
+            "the final AgentEnd must carry the handoff message"
+        ),
+        other => panic!("expected AgentEnd at the end, got {other:?}"),
+    }
 
     // Restore the process-wide switch (see the opt-in above).
     match &previous {

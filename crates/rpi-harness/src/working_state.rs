@@ -60,6 +60,26 @@ pub const REPEAT_TOOL_REMINDER_ENV: &str = "RPI_REPEAT_TOOL_REMINDER";
 /// How many consecutive identical tool-call turns trigger the repeat notice.
 pub const REPEAT_TRIGGER_TURNS: u32 = 3;
 
+/// Marker prefixes of injected reminder messages. Reminders are transient by
+/// design (they live in the loop context only — see the module docs), so any
+/// path that could persist context messages must exclude them. Chief offender:
+/// mid-run compaction, which turns `context.messages` into entries and can
+/// carry a reminder into the retained tail.
+pub const REMINDER_PREFIXES: [&str; 2] = ["[working-state check]", "[repeat notice]"];
+
+/// Whether `message` is a transient working-state reminder (never persisted).
+pub fn is_reminder_message(message: &AgentMessage) -> bool {
+    match message {
+        AgentMessage::User(user) => match &user.content {
+            UserContent::Text(text) => REMINDER_PREFIXES
+                .iter()
+                .any(|prefix| text.starts_with(prefix)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// A reminder the harness wants injected before the next assistant request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reminder {
@@ -227,61 +247,71 @@ pub fn wrap_after_tool_results(
     state: Arc<Mutex<WorkingStateReminder>>,
 ) -> AfterToolResults {
     Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| {
-        // Snapshot every field the inner hook may read BEFORE the async block:
-        // `ctx` borrows cannot live inside a `'static` future (same pattern as
-        // `context_boundary_hook`).
-        let message = ctx.message.clone();
-        let tool_results = ctx.tool_results.to_vec();
-        let new_messages = ctx.new_messages.to_vec();
-        let context_snapshot = ctx.context.clone();
-        let inner = inner.clone();
-        let state = Arc::clone(&state);
-        Box::pin(async move {
-            let inner_update = match inner {
-                Some(hook) => {
-                    hook(ShouldStopAfterTurnContext {
-                        message: &message,
-                        tool_results: &tool_results,
-                        context: &context_snapshot,
-                        new_messages: &new_messages,
+        // Synchronous pre-check, ZERO clones: the reminder decision only
+        // needs the assistant message, and on the (overwhelmingly common)
+        // no-reminder turn we hand `ctx` straight to the inner hook — no
+        // AgentContext/new_messages snapshot at all. Only a turn that actually
+        // fires a reminder pays for the snapshot below.
+        let reminder = state
+            .lock()
+            .ok()
+            .and_then(|mut reminder| reminder.observe_turn(ctx.message));
+        match reminder {
+            None => match inner.as_ref() {
+                // Transparent pipe: the inner hook (compaction, boundary
+                // delivery) gets the borrowed ctx unchanged.
+                Some(hook) => hook(ctx),
+                None => Box::pin(async { None }),
+            },
+            Some(reminder) => {
+                // Snapshot every field the inner hook may read BEFORE the
+                // async block: `ctx` borrows cannot live inside a `'static`
+                // future (same pattern as `context_boundary_hook`).
+                let message = ctx.message.clone();
+                let tool_results = ctx.tool_results.to_vec();
+                let new_messages = ctx.new_messages.to_vec();
+                let context_snapshot = ctx.context.clone();
+                let inner = inner.clone();
+                Box::pin(async move {
+                    let inner_update = match inner {
+                        Some(hook) => {
+                            hook(ShouldStopAfterTurnContext {
+                                message: &message,
+                                tool_results: &tool_results,
+                                context: &context_snapshot,
+                                new_messages: &new_messages,
+                            })
+                            .await
+                        }
+                        None => None,
+                    };
+
+                    // Base = the inner hook's replacement context if it made one,
+                    // otherwise the loop's current context. The reminder rides on
+                    // top so it survives a same-turn compaction.
+                    let mut context = inner_update
+                        .as_ref()
+                        .and_then(|update| update.context.clone())
+                        .unwrap_or(context_snapshot);
+                    context.messages.push(AgentMessage::User(UserMessage::new(
+                        UserContent::Text(reminder.message()),
+                        now_ms(),
+                    )));
+
+                    Some(match inner_update {
+                        Some(mut update) => {
+                            update.context = Some(context);
+                            update
+                        }
+                        None => AgentLoopTurnUpdate {
+                            context: Some(context),
+                            model: None,
+                            thinking_level: None,
+                        },
                     })
-                    .await
-                }
-                None => None,
-            };
-
-            let reminder = state
-                .lock()
-                .ok()
-                .and_then(|mut reminder| reminder.observe_turn(&message));
-            let Some(reminder) = reminder else {
-                return inner_update;
-            };
-
-            // Base = the inner hook's replacement context if it made one,
-            // otherwise the loop's current context. The reminder rides on
-            // top so it survives a same-turn compaction.
-            let mut context = inner_update
-                .as_ref()
-                .and_then(|update| update.context.clone())
-                .unwrap_or(context_snapshot);
-            context.messages.push(AgentMessage::User(UserMessage::new(
-                UserContent::Text(reminder.message()),
-                now_ms(),
-            )));
-
-            Some(match inner_update {
-                Some(mut update) => {
-                    update.context = Some(context);
-                    update
-                }
-                None => AgentLoopTurnUpdate {
-                    context: Some(context),
-                    model: None,
-                    thinking_level: None,
-                },
-            })
-        })
+                })
+            }
+        }
     })
 }
 
@@ -489,6 +519,66 @@ mod tests {
         .message();
         assert!(repeat.contains("identical arguments"), "{repeat}");
         assert!(repeat.contains("change your approach"), "{repeat}");
+    }
+
+    #[test]
+    fn injected_messages_carry_the_marker_prefixes() {
+        // Contract: every injected reminder text MUST start with a
+        // REMINDER_PREFIXES marker — that is what `is_reminder_message` (and
+        // therefore compaction filtering / the never-persisted guarantee)
+        // keys on. Changing the wording without the marker breaks persistence
+        // exclusion; this test is the tripwire.
+        let status = Reminder::StatusCheck {
+            turn: 10,
+            interval: 10,
+        }
+        .message();
+        assert!(
+            REMINDER_PREFIXES.iter().any(|p| status.starts_with(p)),
+            "status text lost its marker: {status}"
+        );
+
+        let repeat = Reminder::RepeatCall {
+            tools: "`bash`".into(),
+            turns: 3,
+        }
+        .message();
+        assert!(
+            REMINDER_PREFIXES.iter().any(|p| repeat.starts_with(p)),
+            "repeat text lost its marker: {repeat}"
+        );
+    }
+
+    #[test]
+    fn is_reminder_message_recognizes_markers_and_rejects_plain_users() {
+        use rpi_agent::message::AgentMessage;
+
+        let reminder = AgentMessage::User(UserMessage::new(
+            UserContent::Text("[working-state check] Turn 4 of this run...".into()),
+            0,
+        ));
+        assert!(is_reminder_message(&reminder));
+
+        let repeat = AgentMessage::User(UserMessage::new(
+            UserContent::Text("[repeat notice] You called bash...".into()),
+            0,
+        ));
+        assert!(is_reminder_message(&repeat));
+
+        let plain = AgentMessage::User(UserMessage::new(
+            UserContent::Text("normal user message".into()),
+            0,
+        ));
+        assert!(!is_reminder_message(&plain));
+
+        // Even a user message that merely MENTIONS the marker later in the
+        // text (e.g. quoting a reminder back) must not be excluded.
+        let quoted = AgentMessage::User(UserMessage::new(
+            UserContent::Text("about that [repeat notice] you sent".into()),
+            0,
+        ));
+        assert!(!is_reminder_message(&quoted),
+            "marker must match at the start, not anywhere");
     }
 
     use rpi_agent::types::AgentContext;
