@@ -51,6 +51,8 @@ mod panels;
 mod pet;
 mod thinking_peek;
 use thinking_peek::ThinkingPeek;
+mod turn_telemetry;
+use turn_telemetry::TurnTelemetryTracker;
 
 #[cfg(test)]
 mod tests;
@@ -1384,6 +1386,7 @@ pub async fn interactive_tui(
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
         thinking_peek: ThinkingPeek::new(),
+        turn_telemetry: TurnTelemetryTracker::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),

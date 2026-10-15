@@ -176,6 +176,9 @@ pub(super) async fn handle_agent_event(
     chat: &Arc<Container>,
     lane: &Arc<dyn AgentLane>,
 ) {
+    // Turn 遥测（pi-open-tui telemetry.ts 移植）：事件入口统一喂入，
+    // turn 落定时产出一行 TPS/TTFT/duration/stall/tokens/cost。
+    let turn_telemetry = state.turn_telemetry.record(&event);
     match event {
         AgentEvent::AgentStart => {
             state.set_status(RunStatus::Working);
@@ -489,6 +492,15 @@ pub(super) async fn handle_agent_event(
             // throttle window has not elapsed.
             tui.render_now(false);
         }
+    }
+    // Turn 遥测行：turn 的 assistant 消息与工具结果都落定后追加，
+    // 保持 transcript 顺序（turn 内容 → 遥测）。
+    if let Some(telemetry) = turn_telemetry {
+        add_note_message(
+            chat,
+            &super::turn_telemetry::format_turn_telemetry(&telemetry),
+        );
+        tui.request_render(false);
     }
 }
 

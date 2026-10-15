@@ -171,6 +171,9 @@ pub(super) struct TuiState {
     /// Thinking-peek 状态机（pi-open-tui peek 移植）：hide-thinking 时用推理
     /// 尾部一行替换静态的 "Thinking..." 标签。
     pub(super) thinking_peek: ThinkingPeek,
+    /// Turn 遥测追踪器（pi-open-tui telemetry.ts 移植）：事件入口统一喂入，
+    /// turn 结束时产出 TPS/TTFT/duration/stall/tokens/cost 一行。
+    pub(super) turn_telemetry: TurnTelemetryTracker,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
     /// the view).
     pub(super) tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
