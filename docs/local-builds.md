@@ -170,3 +170,15 @@
 - [ ] bash/skill codex 面板观感;footer git 状态/⚡ 速率
 - [ ] 粘贴截图 → vision skill 分析
 - [ ] lcy 工作区 delegate_task 派 luna:实时活动行(执行 read/思考中…)、四态完成、Ctrl+O 展开 markdown 报告
+
+### 晋级 #3 增量勘误（同日 22:4x，delegate_task 实战调试三连）
+
+| commit | 内容 |
+|---|---|
+| `216479a` | 内置 delegate_task 接管信封名与参数形状（role/maxTurns/timeoutSeconds 原生兼容，role 无定义走通用子 agent）；假扩展 librpi_subagents.dylib 已移至 extensions-disabled/（strings 逆向证明其从未 spawn 任何进程，纯信封打印机） |
+| `33e0026` | delegate 面板心跳：事件流间隙（子 agent 下载网页的静默期）也每 2s 发 partial，elapsed 计时不再冻结 |
+| `6d3da74` | 面板出生路径修复：面板从 AssistantUpdate 流式路径诞生时未设置 delegate 身份 → 通用空壳框；apply_delegate_info 补齐到全部四个创建/更新点 |
+
+- 实战验证：delegate_task 派 tty7-cli-skill-writer 完整跑 2m11s（调研 2 页面 → 蒸馏 12KB SKILL.md 落盘 ~/.rpi/agent/skills/tty7-cli/ → 结构化回报），面板 `✓ agent · 2m11s` + 简述 + Ctrl+O 展开全程正确
+- 产物 SHA-256：`35113c71…`（06f8b99 时代）→ 后续三个增量提交后已重装，见 `shasum ~/.cargo/bin/rpi`
+- 推送：local_master / feat 双分支均至 `6d3da74` ✓
