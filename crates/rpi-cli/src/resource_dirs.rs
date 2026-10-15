@@ -357,6 +357,15 @@ fn project_resource_dirs(cwd: &Path, sub: &str, kind: ResourceKind) -> Vec<PathB
     };
     dirs.extend(crate::packages::project_package_dirs(cwd, package_kind));
     dirs.push(project_dir(cwd, sub));
+    // `.ai-flow` workspaces (e.g. lcy-ai-procurement-workspace) keep their
+    // skill library under `.ai-flow/skills`. Skills are plain `SKILL.md`
+    // markdown, so the same loader reads them. Only the skills channel is
+    // aligned — `.ai-flow/extensions` are TypeScript extensions rpi cannot
+    // load, and `.ai-flow` has no prompt-template dir (commands are a
+    // different mechanism).
+    if matches!(kind, ResourceKind::Skills) {
+        dirs.push(cwd.join(".ai-flow").join(sub));
+    }
     dirs
 }
 

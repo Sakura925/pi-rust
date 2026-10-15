@@ -29,9 +29,10 @@ pub mod utils {
 
 pub mod tools;
 pub use tools::{
-    create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
-    create_powershell_tool, create_read_tool, create_write_tool, BashExecution, BashPrepare,
-    BashToolOptions, ExecutionToolContext, ProcessedImage, ReadImageProcessor, ReadToolOptions,
+    create_bash_tool, create_delegate_task_tool, create_edit_tool, create_find_tool,
+    create_grep_tool, create_ls_tool, create_powershell_tool, create_read_tool, create_write_tool,
+    BashExecution, BashPrepare, BashToolOptions, ExecutionToolContext, ProcessedImage,
+    ReadImageProcessor, ReadToolOptions,
 };
 
 pub use env::{

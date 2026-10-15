@@ -48,8 +48,9 @@ use rpi_harness::types::{
     HarnessTool, HarnessToolExecution, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool,
-    create_write_tool, ExecutionToolContext, MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_delegate_task_tool, create_edit_tool, create_powershell_tool,
+    create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
+    OsExecutionEnv,
 };
 
 use crate::args::Args;
@@ -1885,6 +1886,10 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         (
             "bash",
             HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
+        ),
+        (
+            "delegate",
+            HarnessTool::new(create_delegate_task_tool(ctx)),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
