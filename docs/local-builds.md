@@ -121,3 +121,52 @@
 
 - 旧二进制备份:`~/.cargo/bin/rpi-bak-20261015-pre-tui-main-screen-fix`(8056320 构建,晋级 #2 产物)
 - 版本红线不变:本改动未引入新 session 格式,回退无格式风险;验收通过后走正式晋级流程
+
+## 晋级 #3:2026-10-15 17:4x · v0.3.24 上游同步 + TUI 大改版(tui-main-screen-fix)
+
+| 项 | 值 |
+|---|---|
+| 晋级 commit | `dd8352b`(feat/tui-main-screen-fix 全链:上游 v0.3.24 merge + 9 功能提交 + 3 审查修复提交),ff 合入 local_master |
+| 版本 | rpi 0.3.24(上游 0.3.24 + 个人功能叠加) |
+| 产物 SHA-256 | `df06699c0e4a6ee69424b5e03f5c860d172e05c6b05e4d26d0946be1e0ac8083` |
+| 构建参数 | `cargo build --release --locked` |
+| 安装一致性 | `~/.cargo/bin/rpi` 与 `target/release/rpi` SHA-256 相同;macOS 先 rm 再 cp |
+
+### 个人内容(叠加在 v0.3.24 之上)
+
+1. **主屏白屏修复**:失控滚动自愈(scroll>屏高全量重发+视口重同步)、空白行中性尾巴 diff 剪枝
+2. **pi-open-tui 功能迁移**:圆角 editor、thinking peek(推理尾部 ticker)、turn 遥测(TPS/TTFT/stall/$)
+3. **codex 式渲染**:bash 面板(无背景、$ dim、折叠 20→6 行、✔/✘/⊘ 单行完成态)、skill ⏵ 紧凑折叠行、footer Starship 增强(git 工作树摘要 + ⚡ 模型速率)
+4. **粘贴附件落盘**:`~/.rpi/tmp/paste/` + 路径注入 prompt(vision skill 可用)
+5. **delegate_task 子 agent 工具**:`.ai-flow/agents/` 定义驱动嵌套 rpi、`--mode json` 事件流实时进度、四态完成(✓/✗/⏱/⊘)、进程组终止+stderr 排空、`.ai-flow/skills` 发现对齐
+
+### 验证记录(全部通过)
+
+| 关卡 | 结果 |
+|---|---|
+| 上游重叠审查 | v0.3.24 与本分支文件零交集,merge 零冲突;上游侧改动集中在 install/updates/prebuilt |
+| codex 外部审查(tty7 派发) | 2×P1(stderr 管道阻塞、进程树残留),探针复现后全部修复(`82cac8d`) |
+| 离线渲染探针审查(用户提供) | 5 项(partial 提前 ✓、timeout 绿勾、无实时进度、标题不稳定、结果偏重),全部修复(`dd8352b`) |
+| `cargo test --workspace --locked` | ALL PASS(rpi-tui 326 / rpi-cli 522 / rpi-tools 77) |
+| 死锁回归 | `dialog_key_routing_*` 1 passed |
+| 冒烟 | `rpi -p` 模型连通("好");`rpi 0.3.24` 版本对上 |
+| 旧 session 兼容 | 0.3.21 会话 `--export` 成功 |
+| 安装入口检查 | local_master ✓ 工作树干净 ✓ HEAD=dd8352b ✓ |
+
+### 推送记录
+
+- `origin/local_master` 1d73a41→dd8352b ✓
+- `origin/feat/tui-main-screen-fix` 新建 → dd8352b ✓
+- main 快进至 v0.3.24(7210550),未推送(纪律:main 永不推)
+
+### 回退保险
+
+- 旧二进制备份:`~/.cargo/bin/rpi-bak-20261015-pre-0.3.24-merge`(8e193de 测试构建,0.3.23)
+- 版本红线:0.3.24 与 0.3.23 session 格式无新增 entry 类型(上游改动仅 install/updates),回退无格式风险,但会丢失全部个人功能
+
+### 试用验收点(此前测试构建的清单+新增)
+
+- [ ] 白屏消失(scrollback 完整)
+- [ ] bash/skill codex 面板观感;footer git 状态/⚡ 速率
+- [ ] 粘贴截图 → vision skill 分析
+- [ ] lcy 工作区 delegate_task 派 luna:实时活动行(执行 read/思考中…)、四态完成、Ctrl+O 展开 markdown 报告
