@@ -1888,7 +1888,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
             HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
         ),
         (
-            "delegate",
+            "delegate_task",
             HarnessTool::new(create_delegate_task_tool(ctx)),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),

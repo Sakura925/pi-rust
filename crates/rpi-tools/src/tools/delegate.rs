@@ -43,19 +43,27 @@ const PARTIAL_TAIL_LINES: usize = 30;
 /// Input for the delegate tool.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct DelegateTaskInput {
-    /// Agent name — resolves to `.ai-flow/agents/{agent}.md` or
-    /// `.rpi/agents/{agent}.md` under the working directory.
-    pub agent: String,
+    /// Agent name — resolves to `.ai-flow/agents/{role}.md` or
+    /// `.rpi/agents/{role}.md` under the working directory. Accepts both
+    /// `role` (envelope-style, preferred by models) and `agent` (legacy).
+    /// A role that matches no definition still runs — as a generic
+    /// sub-agent whose panel shows the role as its identity label.
+    #[serde(default, alias = "agent")]
+    pub role: String,
     /// The self-contained task brief for the sub-agent.
     pub task: String,
     /// Override the agent definition's frontmatter model.
     #[serde(default)]
     pub model: Option<String>,
-    /// Max agent turns for the nested run (default 32).
-    #[serde(default)]
+    /// Max agent turns for the nested run (default 32). Accepts `maxTurns`
+    /// (primary) and `max_turns` (legacy).
+    #[serde(default, rename = "maxTurns", alias = "max_turns")]
+    #[schemars(rename = "maxTurns")]
     pub max_turns: Option<u64>,
-    /// Timeout in seconds (default 600).
-    #[serde(default)]
+    /// Timeout in seconds (default 600). Accepts `timeoutSeconds` (primary)
+    /// and `timeout_seconds` (legacy).
+    #[serde(default, rename = "timeoutSeconds", alias = "timeout_seconds")]
+    #[schemars(rename = "timeoutSeconds")]
     pub timeout_seconds: Option<f64>,
 }
 
@@ -64,6 +72,15 @@ pub struct DelegateTaskInput {
 struct AgentDefinition {
     model: Option<String>,
     body: String,
+}
+
+impl Default for AgentDefinition {
+    fn default() -> Self {
+        Self {
+            model: None,
+            body: String::new(),
+        }
+    }
 }
 
 /// Parse the minimal frontmatter subset the `.ai-flow/agents` files use:
@@ -255,19 +272,14 @@ impl AgentTool for DelegateTool {
         })?;
 
         let cwd = self.env.cwd().to_path_buf();
-        let agent_path =
-            resolve_agent_file(&cwd, &input.agent).ok_or_else(|| {
-                AgentError::Tool(format!(
-                    "delegate_task: unknown agent {:?} — no .ai-flow/agents/{0}.md or \
-                     .rpi/agents/{0}.md under {}",
-                    input.agent,
-                    cwd.display()
-                ))
-            })?;
-        let raw = std::fs::read_to_string(&agent_path).map_err(|e| {
-            AgentError::Tool(format!("delegate_task: read {agent_path:?}: {e}"))
-        })?;
-        let definition = parse_agent_definition(&raw);
+        // Resolve the agent definition — a role that matches no file is NOT an
+        // error: it runs as a generic sub-agent whose panel shows the role as
+        // its identity label (envelope-style roles are often job descriptions,
+        // not .ai-flow file names).
+        let definition = resolve_agent_file(&cwd, &input.role)
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .map(|raw| parse_agent_definition(&raw))
+            .unwrap_or_default();
 
         let model = input.model.clone().or(definition.model);
         let timeout_seconds =
@@ -285,10 +297,25 @@ impl AgentTool for DelegateTool {
                 rules.join("\n")
             )
         };
-        let system_prompt = format!(
-            "You are the sub-agent defined below. Complete the delegated task, then stop.\n\n{}{}",
-            definition.body, rules_note
-        );
+        let system_prompt = if definition.body.trim().is_empty() {
+            // Generic sub-agent: the role didn't resolve to an agent file —
+            // still a REAL bounded run, just without a project persona.
+            format!(
+                "You are a bounded sub-agent (role: {}). Complete the delegated \
+                 task, then stop.{}",
+                if input.role.trim().is_empty() {
+                    "sub-agent"
+                } else {
+                    input.role.trim()
+                },
+                rules_note
+            )
+        } else {
+            format!(
+                "You are the sub-agent defined below. Complete the delegated task, then stop.\n\n{}{}",
+                definition.body, rules_note
+            )
+        };
 
         // Always run the same rpi binary as the parent.
         let exe = std::env::current_exe()
@@ -489,7 +516,7 @@ impl AgentTool for DelegateTool {
                 text_signature: None,
             })],
             details: serde_json::json!({
-                "agent": input.agent,
+                "agent": input.role,
                 "model": model,
                 "outcome": outcome,
                 "exit_status": status_label,
@@ -614,5 +641,53 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["a.md", "b.md"]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod envelope_compat_tests {
+    use super::DelegateTaskInput;
+
+    #[test]
+    fn envelope_style_args_deserialize() {
+        // The shape models already use when calling the (fake) extension's
+        // delegate_task: task/role/maxTurns/timeoutSeconds, plus a stray
+        // `kind` and `recursive` the schema never declared.
+        let raw = serde_json::json!({
+            "kind": "rpi-delegation",
+            "task": "sleep 30 and report",
+            "role": "luna-delegation-agent",
+            "maxTurns": 4,
+            "timeoutSeconds": 120,
+            "recursive": false
+        });
+        let input: DelegateTaskInput = serde_json::from_value(raw).expect("envelope args must parse");
+        assert_eq!(input.role, "luna-delegation-agent");
+        assert_eq!(input.task, "sleep 30 and report");
+        assert_eq!(input.max_turns, Some(4));
+        assert_eq!(input.timeout_seconds, Some(120.0));
+    }
+
+    #[test]
+    fn legacy_snake_case_still_deserializes() {
+        let raw = serde_json::json!({
+            "agent": "luna",
+            "task": "t",
+            "max_turns": 8,
+            "timeout_seconds": 60
+        });
+        let input: DelegateTaskInput = serde_json::from_value(raw).expect("legacy args must parse");
+        assert_eq!(input.role, "luna");
+        assert_eq!(input.max_turns, Some(8));
+        assert_eq!(input.timeout_seconds, Some(60.0));
+    }
+
+    #[test]
+    fn role_without_definition_is_not_an_error() {
+        // A descriptive role that matches no agent file must still construct
+        // the run (generic sub-agent mode) — resolve failure no longer errors.
+        let raw = serde_json::json!({ "task": "t", "role": "tty7 CLI 调研专家" });
+        let input: DelegateTaskInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(input.role, "tty7 CLI 调研专家");
     }
 }
