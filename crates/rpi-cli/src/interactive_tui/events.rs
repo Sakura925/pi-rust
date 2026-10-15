@@ -503,6 +503,22 @@ pub(super) async fn handle_agent_event(
     // Turn 遥测行：turn 的 assistant 消息与工具结果都落定后追加，
     // 保持 transcript 顺序（turn 内容 → 遥测）。
     if let Some(telemetry) = turn_telemetry {
+        // Footer 回填：最近 turn 的模型速率（⚡ tok/s）。
+        state.footer.set_model_rate(telemetry.tps);
+        // Turn 边界刷新 git 工作树摘要（子进程查询放后台线程，避免卡住
+        // 事件 drain；空摘要不覆盖——干净树保持旧标签）。
+        if let Some(cwd) = state.cwd.clone() {
+            let footer = state.footer.clone();
+            let tui_ref = tui.clone();
+            std::thread::spawn(move || {
+                if let Some(status) = crate::interactive_tui::sessions::git_status_for(&cwd) {
+                    if !status.is_empty() {
+                        footer.set_git_status(&status);
+                        tui_ref.request_render(false);
+                    }
+                }
+            });
+        }
         add_note_message(
             chat,
             &super::turn_telemetry::format_turn_telemetry(&telemetry),

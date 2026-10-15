@@ -263,6 +263,9 @@ pub(super) struct TuiState {
     pub(super) autocomplete_selection: std::sync::Mutex<usize>,
     /// Images queued from clipboard paste and attached to the next prompt.
     pub(super) pending_images: std::sync::Mutex<Vec<rpi_ai::types::ImageContent>>,
+    /// Session working directory. Used by turn-boundary git-status refreshes
+    /// (spawned from the event drain so the subprocess never blocks it).
+    pub(super) cwd: Option<std::path::PathBuf>,
     /// The owned theme manager — `/theme` applies presets here. The global
     /// `theme()` is read-only after OnceLock init, so per-instance state is the
     /// only way to apply a preset at runtime.

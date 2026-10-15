@@ -1308,6 +1308,9 @@ pub async fn interactive_tui(
     }
     footer.set_cwd(&cwd.to_string_lossy());
     footer.set_git_branch(git_branch_for(&cwd).as_deref());
+    if let Some(status) = git_status_for(&cwd) {
+        footer.set_git_status(&status);
+    }
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
@@ -1320,6 +1323,11 @@ pub async fn interactive_tui(
         let cwd_ref = cwd.clone();
         crate::fs_watch::watch_path(head, move || {
             footer_ref.set_git_branch(git_branch_for(&cwd_ref).as_deref());
+            // HEAD 变化（commit/checkout）往往伴随工作树状态变化，一并
+            // 刷新摘要。
+            if let Some(status) = git_status_for(&cwd_ref) {
+                footer_ref.set_git_status(&status);
+            }
         })
     });
 
@@ -1417,6 +1425,7 @@ pub async fn interactive_tui(
         autocomplete_max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
+        cwd: Some(cwd.clone()),
         theme_manager,
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),

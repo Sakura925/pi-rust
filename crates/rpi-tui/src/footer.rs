@@ -108,6 +108,11 @@ pub struct FooterComponent {
     home: Mutex<Option<String>>,
     /// Git branch, when inside a repository.
     git_branch: Mutex<Option<String>>,
+    /// Compact git working-tree summary (`↑2↓1 ●3 ✚2 ✖1 ?5`), refreshed
+    /// by the host on startup, HEAD changes, and turn boundaries.
+    git_status: Mutex<String>,
+    /// Model throughput of the most recent turn (tokens/s), when measured.
+    model_rate: Mutex<Option<f64>>,
     /// Session name.
     session_name: Mutex<Option<String>>,
     /// Aggregated usage totals.
@@ -142,6 +147,8 @@ impl FooterComponent {
                     .or_else(|| std::env::var("USERPROFILE").ok()),
             ),
             git_branch: Mutex::new(None),
+            git_status: Mutex::new(String::new()),
+            model_rate: Mutex::new(None),
             session_name: Mutex::new(None),
             usage: Mutex::new(UsageTotals::default()),
             cache_hit_rate: Mutex::new(None),
@@ -207,6 +214,26 @@ impl FooterComponent {
     pub fn set_git_branch(&self, branch: Option<&str>) {
         if let Ok(mut b) = self.git_branch.lock() {
             *b = branch.map(|s| s.to_string());
+        }
+    }
+
+    /// Set the compact git working-tree summary (`↑2↓1 ●3 ✚2 ✖1 ?5`).
+    /// An empty string keeps the previous label (clean trees report
+    /// nothing).
+    pub fn set_git_status(&self, status: &str) {
+        if status.is_empty() {
+            return;
+        }
+        if let Ok(mut s) = self.git_status.lock() {
+            *s = status.to_string();
+        }
+    }
+
+    /// Set the model throughput of the most recent turn in tokens/s; `None`
+    /// clears the rate badge.
+    pub fn set_model_rate(&self, rate: Option<f64>) {
+        if let Ok(mut r) = self.model_rate.lock() {
+            *r = rate;
         }
     }
 
@@ -303,17 +330,25 @@ impl FooterComponent {
         let cwd = self.cwd.lock().unwrap().clone();
         let home = self.home.lock().unwrap().clone();
         let branch = self.git_branch.lock().unwrap().clone();
+        let git_status = self.git_status.lock().unwrap().clone();
         let name = self.session_name.lock().unwrap().clone();
 
         let mut parts = Vec::new();
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             parts.push(format_cwd_for_footer(&cwd, home.as_deref()));
         }
+        // Branch + working-tree summary (pi-open-tui style): `(main ↑2↓1 ●3)`;
+        // the status segments are dropped when the tree is clean.
         if let Some(branch) = branch.filter(|b| !b.is_empty()) {
-            if let Some(last) = parts.last_mut() {
-                *last = format!("{last} ({branch})");
+            let label = if git_status.is_empty() {
+                format!("({branch})")
             } else {
-                parts.push(format!("({branch})"));
+                format!("({branch} {git_status})")
+            };
+            if let Some(last) = parts.last_mut() {
+                *last = format!("{last} {label}");
+            } else {
+                parts.push(label);
             }
         }
         if let Some(name) = name.filter(|n| !n.is_empty()) {
@@ -330,6 +365,7 @@ impl FooterComponent {
         let context_percent = *self.context_percent.lock().unwrap();
         let context_window = *self.context_window.lock().unwrap();
         let auto = *self.auto_compact.lock().unwrap();
+        let model_rate = *self.model_rate.lock().unwrap();
 
         let mut parts: Vec<String> = Vec::new();
         if usage.input > 0 {
@@ -351,6 +387,9 @@ impl FooterComponent {
         }
         if usage.cost > 0.0 {
             parts.push(format!("${:.3}", usage.cost));
+        }
+        if let Some(rate) = model_rate.filter(|r| *r > 0.0) {
+            parts.push(format!("⚡{rate:.1}/s"));
         }
 
         // Context usage: colorized by pressure like upstream.
@@ -515,6 +554,44 @@ impl Component for FooterComponent {
 mod tests {
     use super::*;
     use crate::ansi::strip_ansi;
+
+    /// Git working-tree summary renders inside the branch label on line 1,
+    /// and the model rate renders in the stats line.
+    #[test]
+    fn test_footer_git_status_and_model_rate() {
+        let footer = FooterComponent::new();
+        footer.set_cwd("/home/user/project");
+        footer.set_git_branch(Some("main"));
+        footer.set_git_status("↑2↓1 ●3 ✚2 ?5");
+        footer.add_usage(100, 200, 500, 100, 0.05);
+        footer.set_model_rate(Some(42.5));
+
+        let rows = footer.render(200);
+        let joined = strip_ansi(&rows.join("\n"));
+        // Line 1: branch label carries the working-tree summary.
+        assert!(
+            joined.contains("(main ↑2↓1 ●3 ✚2 ?5)"),
+            "git status missing: {joined}"
+        );
+        // Stats line: the most recent turn's throughput badge.
+        assert!(joined.contains("⚡42.5/s"), "rate badge missing: {joined}");
+
+        // An empty status keeps the previous label (clean trees report
+        // nothing, so the host keeps the last non-empty summary).
+        footer.set_git_status("");
+        let rows = footer.render(200);
+        let joined = strip_ansi(&rows.join("\n"));
+        assert!(
+            joined.contains("(main ↑2↓1 ●3 ✚2 ?5)"),
+            "empty status must not clear: {joined}"
+        );
+
+        // `None` clears the rate badge.
+        footer.set_model_rate(None);
+        let rows = footer.render(200);
+        let joined = strip_ansi(&rows.join("\n"));
+        assert!(!joined.contains("⚡"), "rate badge must be gone: {joined}");
+    }
 
     /// The extension status (langfuse ✓ …) renders after the run status and is
     /// independent of it: clearing the run status must not clear it.

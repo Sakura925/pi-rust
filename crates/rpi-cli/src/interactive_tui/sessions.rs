@@ -667,6 +667,87 @@ pub(super) fn git_branch_for(cwd: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Compact working-tree summary for the footer (pi-open-tui's git status
+/// segments): `↑2↓1` ahead/behind, `●N` staged, `✚N` modified, `✖N` deleted,
+/// `!N` conflicts, `?N` untracked — only non-zero segments are shown. Empty
+/// string when the tree is clean or git is unavailable; the caller keeps the
+/// previous label in that case.
+pub(super) fn git_status_for(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-b")
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ahead = 0usize;
+    let mut behind = 0usize;
+    let mut staged = 0usize;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    let mut conflicts = 0usize;
+    let mut untracked = 0usize;
+    for line in text.lines() {
+        if let Some(branch_info) = line.strip_prefix("## ") {
+            for part in branch_info.split(['[', ']']).filter(|s| s.contains("ahead") || s.contains("behind")) {
+                for piece in part.split(',') {
+                    let piece = piece.trim();
+                    if let Some(n) = piece.strip_prefix("ahead ") {
+                        ahead += n.trim().parse().unwrap_or(0);
+                    } else if let Some(n) = piece.strip_prefix("behind ") {
+                        behind += n.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            continue;
+        }
+        if line.len() < 2 {
+            continue;
+        }
+        let (index, work) = (line.as_bytes()[0], line.as_bytes()[1]);
+        match index {
+            b'?' => untracked += 1,
+            b'U' | b'A' if work == b'U' || index == b'U' => conflicts += 1,
+            b'A' | b'C' | b'M' | b'R' => staged += 1,
+            b'D' => deleted += 1,
+            _ => {}
+        }
+        match work {
+            b'M' | b'C' | b'T' if index != b'?' => modified += 1,
+            b'D' if index != b'D' && index != b'?' => deleted += 1,
+            b'U' => conflicts += 1,
+            _ => {}
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if ahead > 0 {
+        parts.push(format!("↑{ahead}"));
+    }
+    if behind > 0 {
+        parts.push(format!("↓{behind}"));
+    }
+    if staged > 0 {
+        parts.push(format!("●{staged}"));
+    }
+    if modified > 0 {
+        parts.push(format!("✚{modified}"));
+    }
+    if deleted > 0 {
+        parts.push(format!("✖{deleted}"));
+    }
+    if conflicts > 0 {
+        parts.push(format!("!{conflicts}"));
+    }
+    if untracked > 0 {
+        parts.push(format!("?{untracked}"));
+    }
+    Some(parts.join(" "))
+}
+
 /// The name displayed for a model id (last path segment / after the final
 /// `:`), to keep the footer compact.
 pub(super) fn short_model_name(id: &str) -> String {

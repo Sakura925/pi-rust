@@ -17,15 +17,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::component::Component;
-use crate::ansi::bold;
 use crate::ansi::strip_ansi;
 use crate::spacer::Spacer;
 use crate::theme::{theme, theme_revision};
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
 use crate::visual_truncate::truncate_to_visual_lines;
 
-/// Preview line limit when collapsed (matches the TS `PREVIEW_LINES`).
-const PREVIEW_LINES: usize = 20;
+/// Preview line limit when collapsed. Codex-style compact panels keep the
+/// folded output tail short so a finished command reads as a glanceable
+/// summary instead of a wall of text.
+const PREVIEW_LINES: usize = 6;
 
 /// After this long without a result, a running bash panel shows the
 /// "Esc / Ctrl+C 中止" hint (the tool has no default timeout — the model must
@@ -223,7 +224,9 @@ impl BashExecutionComponent {
             .unwrap_or_default()
     }
 
-    /// Build the trailing status/truncation line(s), if any.
+    /// Build the trailing status line(s) in the codex style: a status glyph
+    /// leads the line (✔ / ✘ / ⊘), followed by the elapsed time and the
+    /// folded-output hint. Truncation keeps its own warning line.
     fn status_line(&self, hidden: usize) -> Vec<String> {
         let status = *self.status.lock().unwrap();
         let truncation = self.truncation.lock().unwrap().clone();
@@ -231,9 +234,16 @@ impl BashExecutionComponent {
         let expanded = *self.expanded.lock().unwrap();
         let colors = theme().colors;
 
-        let mut parts: Vec<String> = Vec::new();
-        // Total elapsed up front: it is the first thing a reader looks for on a
-        // finished command.
+        let (glyph, glyph_color) = match status {
+            BashStatus::Complete => ("✔", colors.success),
+            BashStatus::Error => ("✘", colors.error),
+            BashStatus::Cancelled => ("⊘", colors.warning),
+            BashStatus::Running => ("●", colors.accent),
+        };
+        let mut parts: Vec<String> = vec![glyph_color.fg(glyph)];
+
+        // Total elapsed up front: it is the first thing a reader looks for on
+        // a finished command.
         let elapsed = self.elapsed();
         if elapsed > Duration::from_millis(100) {
             parts.push(
@@ -242,41 +252,39 @@ impl BashExecutionComponent {
                     .fg(&crate::tool_execution::format_elapsed(elapsed)),
             );
         }
-        if hidden > 0 {
-            if expanded {
-                parts.push(colors.muted.fg("(Ctrl+O to collapse)"));
-            } else {
-                parts.push(
-                    colors
-                        .muted
-                        .fg(&format!("... {} more lines (Ctrl+O to expand)", hidden)),
-                );
-            }
-        }
         match status {
-            BashStatus::Cancelled => parts.push(colors.warning.fg("(cancelled)")),
+            BashStatus::Cancelled => parts.push(colors.warning.fg("cancelled")),
             BashStatus::Error => {
                 parts.push(
                     colors
                         .error
-                        .fg(&format!("(exit {})", exit_code.unwrap_or(-1))),
+                        .fg(&format!("exit {}", exit_code.unwrap_or(-1))),
                 );
             }
             _ => {}
         }
+        if hidden > 0 {
+            if expanded {
+                parts.push(colors.dim.fg("(ctrl+o to collapse)"));
+            } else {
+                parts.push(colors.dim.fg(&format!(
+                    "+{hidden} lines (ctrl+o for more)"
+                )));
+            }
+        }
+
+ let mut out = Vec::new();
+        if parts.len() > 1 {
+            out.push(parts.join(" "));
+        }
         if truncation.truncated {
             let path = truncation.full_output_path.as_deref().unwrap_or("");
-            parts.push(
-                colors
-                    .warning
-                    .fg(&format!("Output truncated. Full output: {}", path)),
-            );
+            out.push(colors.warning.fg(&format!(
+                "⚠ output truncated. full output: {}",
+                path
+            )));
         }
-        if parts.is_empty() {
-            Vec::new()
-        } else {
-            vec![format!("  {}", parts.join(" "))]
-        }
+        out
     }
 }
 
@@ -305,35 +313,26 @@ impl Component for BashExecutionComponent {
         let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
 
-        // `!!` commands are excluded from the model context, so they render
-        // dim instead of the normal bash color (mirrors `bash-execution.ts`).
-        let excluded = *self.exclude_from_context.lock().unwrap();
-        let color_key = if excluded {
-            colors.dim
-        } else {
-            colors.bash_mode
-        };
+        // `!!` commands are excluded from the model context. Both render dim
+        // in the codex style; excluded ones stay visually indistinct (the
+        // shell transcript reads uniformly).
+        let _excluded = *self.exclude_from_context.lock().unwrap();
+        let color_key = colors.dim;
 
-        // Background tint for the bash panel — mirrors the tool execution
-        // panel backgrounds so bash blocks visually match tool blocks.
-        let bg = match *self.status.lock().unwrap() {
-            BashStatus::Running => colors.tool_pending_bg,
-            BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
-            BashStatus::Complete => colors.tool_success_bg,
-        };
+        // Codex-style compact panel: no background tint, a dim `$ command`
+        // header, and a short folded output tail. The visual grouping comes
+        // from the leading spacer and consistent dim styling instead of a
+        // filled block.
 
         // Spacer
         lines.extend(Spacer::new(1).render(width));
 
-        // Command header: "$ {command}" in accent.
+        // Command header: "$ {command}" in dim (codex style).
         let command = self.command.lock().unwrap().clone();
         let header_text = format!("$ {command}");
-        let header_width = width.saturating_sub(2).max(1);
+        let header_width = width.max(1);
         for part in wrap_text_with_ansi(&header_text, header_width) {
-            let line = format!("  {}", color_key.fg(&bold(&part)));
-            lines.push(crate::utils::apply_background_to_line(&line, width, |s| {
-                bg.bg(s)
-            }));
+            lines.push(color_key.fg(&part));
         }
 
         // Output preview
@@ -362,9 +361,7 @@ impl Component for BashExecutionComponent {
             }
         };
         for dl in &display_lines {
-            lines.push(crate::utils::apply_background_to_line(dl, width, |s| {
-                bg.bg(s)
-            }));
+            lines.push(dl.clone());
         }
 
         // Spinner (while running) or status line (when complete)
@@ -374,34 +371,23 @@ impl Component for BashExecutionComponent {
             // operations never look like two different kinds of "busy".
             let elapsed = self.elapsed();
             let row = format!(
-                "  {} {}",
+                "{} {}",
                 colors.accent.fg("●"),
                 colors
                     .muted
                     .fg(&crate::tool_execution::format_elapsed(elapsed)),
             );
             let row = truncate_to_width(&row, width, "…");
-            lines.push(crate::utils::apply_background_to_line(&row, width, |s| {
-                bg.bg(s)
-            }));
+            lines.push(row);
             if elapsed > LONG_RUNNING_HINT_AFTER {
-                let hint = format!("  {} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
+                let hint = format!("{} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
                 let hint = truncate_to_width(&hint, width, "…");
-                lines.push(crate::utils::apply_background_to_line(&hint, width, |s| {
-                    bg.bg(s)
-                }));
+                lines.push(hint);
             }
         } else {
             let sl = self.status_line(hidden);
-            if !sl.is_empty() {
-                lines.push(crate::utils::apply_background_to_line("", width, |s| {
-                    bg.bg(s)
-                }));
-                for sline in &sl {
-                    lines.push(crate::utils::apply_background_to_line(sline, width, |s| {
-                        bg.bg(s)
-                    }));
-                }
+            for sline in &sl {
+                lines.push(sline.clone());
             }
         }
 
@@ -500,20 +486,17 @@ mod tests {
         assert!(excluded.is_excluded_from_context());
 
         let colors = theme().colors;
-        // The command header uses the bash accent (or dim when excluded), so
-        // compare the foreground escape each color produces.
-        let bash_start = colors
-            .bash_mode
-            .fg("X")
-            .split('X')
-            .next()
-            .unwrap()
-            .to_string();
+        // Codex style: both normal and `!!`-excluded commands render the
+        // header dim — the flag stays semantic (context exclusion), not a
+        // color switch.
         let dim_start = colors.dim.fg("X").split('X').next().unwrap().to_string();
 
         let normal_out = normal.render(40).join("\n");
         let excluded_out = excluded.render(40).join("\n");
-        assert!(normal_out.contains(&bash_start), "normal: {normal_out:?}");
+        assert!(
+            normal_out.contains(&dim_start),
+            "normal must render dim: {normal_out:?}"
+        );
         assert!(
             excluded_out.contains(&dim_start),
             "excluded: {excluded_out:?}"
@@ -522,10 +505,10 @@ mod tests {
         // Both still show the command itself.
         assert!(strip_ansi(&excluded_out).contains("$ echo hi"));
 
-        // Flipping the flag in place recolors without recreating the component.
+        // The exclusion flag is still queryable / flippable in place.
         excluded.set_exclude_from_context(false);
         assert!(!excluded.is_excluded_from_context());
-        assert!(excluded.render(40).join("\n").contains(&bash_start));
+        assert!(excluded.render(40).join("\n").contains("$ echo hi"));
     }
 
     #[test]

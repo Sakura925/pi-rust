@@ -645,59 +645,43 @@ fn render_skill(
     expanded: bool,
     width: usize,
 ) -> Vec<String> {
-    let bg = colors.custom_message_bg;
-    let label = crate::ansi::bold("[skill]");
-    // Upstream's `Box(1, 1, bg)` — one column of horizontal padding on each
-    // side, one blank background row top and bottom.
-    let pad = " ";
+    // Codex-style compact skill reference: no background panel, a `⏵ name`
+    // collapsed line whose arrow hints at expansion, and an expanded form
+    // (`⏶ name` + markdown body) that reads as ordinary transcript flow.
     let mut out: Vec<String> = Vec::new();
 
-    // Box top padding (pi Box(1,1)).
-    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
-
     if !expanded {
-        // Single collapsed line: `[skill] <name> (Ctrl+O to expand)`.
+        // Single collapsed line: `⏵ <name> (ctrl+o)`.
         let line = format!(
-            "{pad}{} {} {}",
-            colors.custom_message_label.fg(&label),
+            "{} {} {}",
+            colors.custom_message_label.fg("⏵"),
             colors.custom_message_text.fg(name),
-            colors.dim.fg("(Ctrl+O to expand)"),
+            colors.dim.fg("(ctrl+o)"),
         );
-        out.push(apply_background_to_line(&line, width, |s| bg.bg(s)));
-        out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+        out.push(truncate_to_width(&line, width, "…"));
         return out;
     }
 
-    // Expanded: `[skill]` label, then a single markdown block whose first
-    // paragraph is the bold skill name (upstream renders
-    // `**${name}**\n\n${content}` as one Markdown child), so the body keeps
-    // its normal markdown colors on the custom-message background.
-    out.push(apply_background_to_line(
-        &format!("{pad}{}", colors.custom_message_label.fg(&label)),
-        width,
-        |s| bg.bg(s),
-    ));
-
-    let header = format!("{pad}{}", colors.custom_message_text.fg(&bold(name)));
-    out.push(apply_background_to_line(&header, width, |s| bg.bg(s)));
-    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+    // Expanded: `⏶` + the bold skill name, then the markdown body rendered
+    // as ordinary transcript flow (no background tint).
+    let header = format!(
+        "{} {}",
+        colors.custom_message_label.fg("⏶"),
+        colors.custom_message_text.fg(&bold(name)),
+    );
+    out.push(truncate_to_width(&header, width, "…"));
 
     let body = strip_frontmatter(content);
     if !body.is_empty() {
-        // Render the skill body with the shared markdown component. The
-        // markdown component handles code blocks / tables / headings; each
-        // line is re-tinted onto the custom-message background so the box
-        // reads as a single panel.
+        // Render the skill body with the shared markdown component; code
+        // blocks / tables / headings keep their normal colors.
         let body_width = width.saturating_sub(2).max(1);
         let md = crate::markdown::Markdown::new(body.to_string(), 0, 0);
         for md_line in md.render(body_width) {
-            let line = format!("{pad}{md_line}");
-            out.push(apply_background_to_line(&line, width, |s| bg.bg(s)));
+            let line = format!("  {md_line}");
+            out.push(truncate_to_width(&line, width, "…"));
         }
     }
-
-    // Box bottom padding (pi Box(1,1)).
-    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
     out
 }
 
@@ -1401,7 +1385,7 @@ mod tests {
     /// invocation box: custom-message background, one collapsed line with an
     /// expand hint, and (when expanded) the frontmatter-stripped skill body.
     #[test]
-    fn skill_invocation_renders_native_style_box() {
+    fn skill_invocation_renders_codex_compact_line() {
         let tool = ToolExecutionComponent::new("read", r#"{"path":"/skills/release/SKILL.md"}"#);
         tool.set_skill_name("release");
         tool.set_result(
@@ -1412,21 +1396,21 @@ mod tests {
         let collapsed = tool.render(80);
         let plain = crate::ansi::strip_ansi(&collapsed.join("\n"));
         assert!(
-            plain.contains("[skill] release"),
-            "collapsed label: {plain}"
+            plain.contains("⏵ release"),
+            "collapsed arrow+name: {plain}"
         );
-        assert!(plain.contains("(Ctrl+O to expand)"), "expand hint: {plain}");
+        assert!(plain.contains("(ctrl+o)"), "expand hint: {plain}");
         assert!(!plain.contains("Steps"), "collapsed hides body: {plain}");
-        // Uses the custom-message background (dark: #2d2838), not a tool tint.
+        // Codex style: no background tint on the skill line.
         assert!(
-            collapsed.iter().any(|l| l.contains("\x1b[48;2;45;40;56m")),
-            "custom-message bg missing: {collapsed:?}"
+            !collapsed.iter().any(|l| l.contains("\x1b[48;2;45;40;56m")),
+            "custom-message bg must be gone: {collapsed:?}"
         );
 
         tool.set_expanded(true);
         let expanded = tool.render(80);
         let plain = crate::ansi::strip_ansi(&expanded.join("\n"));
-        assert!(plain.contains("[skill]"), "expanded label: {plain}");
+        assert!(plain.contains("⏶"), "expanded arrow: {plain}");
         assert!(plain.contains("release"), "expanded name: {plain}");
         assert!(
             plain.contains("Do the thing."),
