@@ -1092,10 +1092,10 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
          handoff at {handoff_position:?}, notice at {notice_position:?}"
     );
 
-    // Event contract: the loop emits ITS AgentEnd when it stops, but the run
-    // is not over — the handoff re-enters Working (AgentStart) and only the
-    // final AgentEnd, carrying the handoff message, closes it. Consumers that
-    // stop on AgentEnd must therefore see the handoff first.
+    // Event contract: the loop's own AgentEnd is HELD while the handoff runs,
+    // so the whole run shows exactly ONE terminal event, and it fires only
+    // after the handoff is done — a consumer that exits on the first AgentEnd
+    // must still see the handoff messages.
     let events = events.lock().unwrap();
     let agent_end_positions: Vec<usize> = events
         .iter()
@@ -1104,21 +1104,26 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
             matches!(event, AgentEvent::AgentEnd { .. }).then_some(index)
         })
         .collect();
-    assert!(
-        agent_end_positions.len() >= 2,
-        "expected the loop's AgentEnd + the handoff's AgentEnd, got {} ends",
+    assert_eq!(
+        agent_end_positions.len(),
+        1,
+        "the budget-held AgentEnd must flush exactly once, not {}",
         agent_end_positions.len()
     );
-    let first_end = agent_end_positions[0];
-    let last_end = *agent_end_positions.last().unwrap();
-    let between = &events[first_end + 1..last_end];
+    let only_end = agent_end_positions[0];
+    let handoff_message_start = events.iter().position(|event| matches!(
+        event,
+        AgentEvent::MessageStart {
+            message: AgentMessage::Assistant(assistant),
+        } if rpi_ai::types::Content::text_only(&assistant.content, "\n")
+            .contains("handoff: completed")
+    ));
     assert!(
-        between
-            .iter()
-            .any(|event| matches!(event, AgentEvent::AgentStart)),
-        "the handoff must re-enter Working (AgentStart) after the loop's AgentEnd"
+        matches!(handoff_message_start, Some(start) if start < only_end),
+        "the handoff must be emitted BEFORE the single AgentEnd; \
+         handoff MessageStart at {handoff_message_start:?}, AgentEnd at {only_end}"
     );
-    match &events[last_end] {
+    match &events[only_end] {
         AgentEvent::AgentEnd { messages } => assert!(
             messages.iter().any(|message| match message {
                 AgentMessage::Assistant(assistant) => rpi_ai::types::Content::text_only(
@@ -1128,10 +1133,26 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
                 .contains("handoff: completed"),
                 _ => false,
             }),
-            "the final AgentEnd must carry the handoff message"
+            "the single AgentEnd must carry the handoff message"
         ),
         other => panic!("expected AgentEnd at the end, got {other:?}"),
     }
+
+    // Result contract: a persisted handoff is the run's real last word. The
+    // loop's terminal message was a tool call, but `final_message` (which
+    // print mode / JSON finalText read) must surface the summary.
+    assert!(
+        matches!(
+            &result.outcome,
+            HarnessRunOutcome::Completed { final_message, .. } if rpi_ai::types::Content::text_only(
+                &final_message.content,
+                "\n",
+            )
+            .contains("handoff: completed")
+        ),
+        "the Completed outcome's final_message must be the handoff, got {:?}",
+        result.outcome
+    );
 
     // Restore the process-wide switch (see the opt-in above).
     match &previous {

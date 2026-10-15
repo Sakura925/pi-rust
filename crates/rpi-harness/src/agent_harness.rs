@@ -604,6 +604,64 @@ pub const HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// extra call cannot turn into another long generation.
 pub const HANDOFF_MAX_TOKENS: u64 = 4096;
 
+/// Holds back the loop's `AgentEnd` on budget-armed runs so the terminal event
+/// reaches consumers exactly once, AFTER the bounded handoff and its
+/// truncation notice are durable (see `run_core`). Without this, the loop
+/// emits `AgentEnd` the moment it stops asking for tools — the TUI goes idle
+/// and remote consumers stop draining while the handoff call (up to
+/// `HANDOFF_TIMEOUT`) is still in flight, and a consumer that exits on the
+/// first terminal event never sees the summary.
+///
+/// Behaviour: `AgentEnd` is stored (replacing any earlier attempt's held end)
+/// instead of forwarded; every other event passes through untouched.
+/// [`Self::flush`] forwards the held end exactly once — only `run_core` calls
+/// it, once the run is truly over. A budget-disabled run never installs this
+/// wrapper, so default event order is byte-for-byte upstream.
+struct DeferredAgentEndEmitter {
+    inner: Arc<dyn AgentEmitter>,
+    /// The held terminal event's message list. `None` until the loop emits
+    /// its `AgentEnd`, or after a flush.
+    held: Mutex<Option<Vec<AgentMessage>>>,
+}
+
+impl DeferredAgentEndEmitter {
+    fn new(inner: Arc<dyn AgentEmitter>) -> Self {
+        Self {
+            inner,
+            held: Mutex::new(None),
+        }
+    }
+
+    /// Forward the held `AgentEnd` with `extra` (the handoff message) appended
+    /// to its messages, exactly once. No-op when nothing is held (budget never
+    /// fired, or the flush already ran).
+    async fn flush(&self, extra: Vec<AgentMessage>) {
+        let held = self.held.lock().unwrap().take();
+        if let Some(mut messages) = held {
+            messages.extend(extra);
+            self.inner
+                .emit(AgentEvent::AgentEnd { messages })
+                .await;
+        }
+    }
+}
+
+impl AgentEmitter for DeferredAgentEndEmitter {
+    fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+        if let AgentEvent::AgentEnd { messages } = event {
+            // Hold, don't forward. A later attempt's end replaces an earlier
+            // one: consumers must see ONE terminal event either way.
+            *self.held.lock().unwrap() = Some(messages);
+            return Box::pin(async {});
+        }
+        self.inner.emit(event)
+    }
+
+    fn try_emit(&self, event: AgentEvent) {
+        self.inner.try_emit(event);
+    }
+}
+
 /// Shared mutable state. Cloned out (field-by-field) at the start of each
 /// operation so the loop sees a consistent snapshot; setters replace fields
 /// in place.
@@ -3767,6 +3825,12 @@ impl AgentHarness {
         // run (`docs/debugging/llm-repetition-forensics.md` §二). Upstream has no such
         // ceiling either, so this is **off unless** `RPI_MAX_TURNS_PER_RUN=<n>`
         // asks for it; when off the hook stays `None` and the loop is unchanged.
+        // Reminder identity registry: timestamps of the working-state messages
+        // this run injects (see `working_state`). Created BEFORE the config
+        // below so the compaction hook and the reminder wrapper share it; it
+        // stays empty (and the compaction filter becomes a no-op) unless the
+        // reminders are enabled.
+        let reminder_registry = crate::working_state::reminder_timestamps();
         let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
         let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
             if run_budget.lock().unwrap().is_enabled() {
@@ -3825,6 +3889,7 @@ impl AgentHarness {
                     .cloned();
                 let compaction_signal = signal.clone();
                 let compaction_run_id = run_id.clone();
+                let reminder_registry_for_hook = Arc::clone(&reminder_registry);
                 if enabled && model.context_window > 0 && provider.is_some() {
                     let cut_for_hook = Arc::clone(&post_compaction_cut);
                     Some(Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, Option<rpi_agent::AgentLoopTurnUpdate>> {
@@ -3836,6 +3901,7 @@ impl AgentHarness {
                         let compaction_run_id = compaction_run_id.clone();
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
+                        let reminder_registry = Arc::clone(&reminder_registry_for_hook);
                         Box::pin(async move {
                             let tokens = estimate_context_tokens(&context.messages).tokens;
                             if !should_compact(tokens, model.context_window as i64, &settings) {
@@ -3845,8 +3911,10 @@ impl AgentHarness {
                             // live in the loop context only, so a mid-run
                             // compaction must not carry one into entries/retained
                             // tail. Filter them BEFORE building the runtime
-                            // entries — see `working_state::is_reminder_message`.
-                            let entries: Vec<Entry> = context.messages.iter().filter(|message| !crate::working_state::is_reminder_message(message)).enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
+                            // entries — see `working_state::is_injected_reminder`
+                            // (identity by injected timestamp, so a user message
+                            // that merely LOOKS like a reminder is never dropped).
+                            let entries: Vec<Entry> = context.messages.iter().filter(|message| !crate::working_state::is_injected_reminder(message, &reminder_registry)).enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
                                 base: crate::session::types::EntryBase { entry_type: "message".into(), id: format!("runtime-{i}"), seq: i as u64 + 1, parent_id: None, timestamp: i as i64 },
                                 message: message.clone(), terminate: None,
                             })).collect();
@@ -3925,9 +3993,10 @@ impl AgentHarness {
             Arc::new(Mutex::new(crate::working_state::WorkingStateReminder::from_env()));
         if working_state.lock().unwrap().is_enabled() {
             let state = Arc::clone(&working_state);
+            let registry = Arc::clone(&reminder_registry);
             let inner = config.after_tool_results.take();
             config.after_tool_results =
-                Some(crate::working_state::wrap_after_tool_results(inner, state));
+                Some(crate::working_state::wrap_after_tool_results(inner, state, registry));
         }
         config.prepare_next_turn = Some(self.context_boundary_hook(
             None,
@@ -3976,6 +4045,26 @@ impl AgentHarness {
             Arc::clone(&settle_state),
             self.clone(),
         ));
+        // Budget-armed runs hold the loop's `AgentEnd` back (the loop emits it
+        // the moment it stops asking for tools, which is BEFORE the bounded
+        // handoff + truncation notice complete). Consumers that stop on the
+        // first terminal event (TUI idle, remote drains) must see the handoff
+        // first, so the held event is flushed exactly once — after the
+        // handoff when the budget fired, otherwise right after the loop. A
+        // retry attempt's held end is replaced by the next attempt's; either
+        // way consumers see ONE terminal event per run.
+        let (deferred_end, emitter): (
+            Option<Arc<DeferredAgentEndEmitter>>,
+            Arc<dyn AgentEmitter>,
+        ) = if run_budget.lock().unwrap().is_enabled() {
+            let deferred = Arc::new(DeferredAgentEndEmitter::new(Arc::clone(&emitter)));
+            (
+                Some(Arc::clone(&deferred) as Arc<DeferredAgentEndEmitter>),
+                deferred as Arc<dyn AgentEmitter>,
+            )
+        } else {
+            (None, emitter)
+        };
         let result = loop {
             // Entering from an assistant runs that message's tools as its very
             // first action, which is exactly why it is never retried (see below).
@@ -4108,18 +4197,9 @@ impl AgentHarness {
                 // `Send`, and holding it across `append_message` would make the
                 // whole run future non-`Send`.
                 let budget_stop = run_budget.lock().unwrap().stop();
+                let mut handoff_agent_message: Option<AgentMessage> = None;
+                let mut handoff_entry_id: Option<String> = None;
                 if let Some(stop) = budget_stop {
-                    // Event contract for the handoff: the loop has already
-                    // emitted its AgentEnd, but the run is NOT over — the
-                    // bounded summary call below can hold the lane for up to
-                    // HANDOFF_TIMEOUT. Re-enter the Working state for its
-                    // duration (AgentStart) and close it AFTER the truncation
-                    // notice is durable, so consumers that stop on AgentEnd
-                    // (TUI idle, remote drains) see the handoff and the notice
-                    // before the run truly ends.
-                    base_emitter.emit(AgentEvent::AgentStart).await;
-                    let mut handoff_for_agent_end: Vec<AgentMessage> = Vec::new();
-
                     // Bounded handoff: before the deterministic truncation
                     // notice, give the model ONE last tool-free, output-capped
                     // summary call so the transcript ends with "done / remains /
@@ -4144,7 +4224,7 @@ impl AgentHarness {
                             .append_message(agent_message.clone())
                             .await
                         {
-                            Ok(_) => {
+                            Ok(entry_id) => {
                                 // Surface the handoff in the live transcript.
                                 // Emit through the raw emitter on purpose: the
                                 // settling/frame wrappers are loop machinery
@@ -4160,7 +4240,8 @@ impl AgentHarness {
                                         message: agent_message.clone(),
                                     })
                                     .await;
-                                handoff_for_agent_end = vec![agent_message];
+                                handoff_agent_message = Some(agent_message);
+                                handoff_entry_id = Some(entry_id);
                             }
                             Err(error) => tracing::warn!(
                                 lane = %self.lane,
@@ -4183,15 +4264,39 @@ impl AgentHarness {
                             "could not record the run-budget stop notice"
                         );
                     }
-                    // Close the handoff's Working state (see the AgentStart
-                    // above) only after the notice is durable.
-                    base_emitter
-                        .emit(AgentEvent::AgentEnd {
-                            messages: handoff_for_agent_end,
-                        })
-                        .await;
                 }
-                let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
+                // Flush the held AgentEnd: the loop emitted it when it stopped
+                // asking for tools, but only now — handoff persisted, notice
+                // durable — is the run actually over. The single terminal
+                // event carries the handoff message when there is one. Runs
+                // that never stopped on the budget (held is None after a
+                // budget-off run, or the flush below already ran) no-op.
+                if let Some(deferred) = &deferred_end {
+                    let extra = handoff_agent_message
+                        .clone()
+                        .map(|message| vec![message])
+                        .unwrap_or_default();
+                    deferred.flush(extra).await;
+                }
+                let mut outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
+                // A persisted handoff is the run's real last word: the loop's
+                // terminal message was a tool call, but CLI consumers read
+                // `final_message`/`finalText` (print mode, JSON output) and must
+                // get the summary, not an empty tool-call turn. Failure keeps
+                // the degraded outcome (derive_outcome) untouched.
+                if let (Some(agent_message), Some(entry_id)) = (&handoff_agent_message, &handoff_entry_id) {
+                    if let AgentMessage::Assistant(assistant) = agent_message {
+                        if let HarnessRunOutcome::Completed {
+                            final_entry_id,
+                            final_message,
+                            ..
+                        } = &mut outcome
+                        {
+                            *final_entry_id = entry_id.clone();
+                            *final_message = (**assistant).clone();
+                        }
+                    }
+                }
                 // The run's messages are durable now, so its frames are no
                 // longer needed as progress. Retiring them here (rather than at
                 // each `MessageEnd`) is what keeps a *failed retry attempt*'s
@@ -4283,6 +4388,12 @@ impl AgentHarness {
                 )
             }
         };
+
+        // Error paths bypass the Ok arm's flush above; held AgentEnds must
+        // never be lost, so flush (no handoff to add) whatever is still held.
+        if let Some(deferred) = &deferred_end {
+            deferred.flush(Vec::new()).await;
+        }
 
         let is_suspended = matches!(outcome, HarnessRunOutcome::Suspended { .. });
 

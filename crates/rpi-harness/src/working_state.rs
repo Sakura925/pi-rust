@@ -44,7 +44,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use futures::future::BoxFuture;
 use rpi_agent::hooks::AfterToolResults;
 use rpi_agent::message::AgentMessage;
 use rpi_agent::types::{AgentLoopTurnUpdate, ShouldStopAfterTurnContext};
@@ -60,22 +59,45 @@ pub const REPEAT_TOOL_REMINDER_ENV: &str = "RPI_REPEAT_TOOL_REMINDER";
 /// How many consecutive identical tool-call turns trigger the repeat notice.
 pub const REPEAT_TRIGGER_TURNS: u32 = 3;
 
-/// Marker prefixes of injected reminder messages. Reminders are transient by
-/// design (they live in the loop context only — see the module docs), so any
-/// path that could persist context messages must exclude them. Chief offender:
-/// mid-run compaction, which turns `context.messages` into entries and can
-/// carry a reminder into the retained tail.
-pub const REMINDER_PREFIXES: [&str; 2] = ["[working-state check]", "[repeat notice]"];
+/// Timestamps of reminder messages injected THIS run. Reminders are transient
+/// by design (they live in the loop context only — see the module docs), so
+/// any path that could persist context messages must exclude them. Chief
+/// offender: mid-run compaction, which turns `context.messages` into entries
+/// and can carry a reminder into the retained tail.
+///
+/// Identity is by INJECTION TIMESTAMP, not by text prefix: a user may
+/// legitimately send a message starting with `[repeat notice]` (e.g. asking
+/// what the notice means), and a prefix check would silently drop it from
+/// compaction. Only messages this harness actually injected — registered at
+/// injection time — are transient. The registry is per-run and stays empty
+/// when the reminders are disabled, so the compaction filter costs and risks
+/// nothing by default.
+pub type ReminderTimestamps = Arc<Mutex<Vec<i64>>>;
 
-/// Whether `message` is a transient working-state reminder (never persisted).
-pub fn is_reminder_message(message: &AgentMessage) -> bool {
+/// Create an empty per-run reminder registry.
+pub fn reminder_timestamps() -> ReminderTimestamps {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// Register an injected reminder's identity and build the message with it.
+fn register_and_build(text: String, registry: &ReminderTimestamps) -> AgentMessage {
+    let timestamp = now_ms();
+    if let Ok(mut registered) = registry.lock() {
+        registered.push(timestamp);
+    }
+    AgentMessage::User(UserMessage::new(UserContent::Text(text), timestamp))
+}
+
+/// Whether `message` is a reminder this harness injected this run (never
+/// persisted). Anything else — including a user message that merely *looks*
+/// like a reminder — is durable and must survive compaction.
+pub fn is_injected_reminder(message: &AgentMessage, registry: &ReminderTimestamps) -> bool {
+    let Ok(registered) = registry.lock() else {
+        // A poisoned registry must not fail closed (dropping real history).
+        return false;
+    };
     match message {
-        AgentMessage::User(user) => match &user.content {
-            UserContent::Text(text) => REMINDER_PREFIXES
-                .iter()
-                .any(|prefix| text.starts_with(prefix)),
-            _ => false,
-        },
+        AgentMessage::User(user) => registered.contains(&user.timestamp),
         _ => false,
     }
 }
@@ -245,6 +267,7 @@ fn tool_call_names(message: &AssistantMessage) -> String {
 pub fn wrap_after_tool_results(
     inner: Option<AfterToolResults>,
     state: Arc<Mutex<WorkingStateReminder>>,
+    registry: ReminderTimestamps,
 ) -> AfterToolResults {
     Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| {
         // Synchronous pre-check, ZERO clones: the reminder decision only
@@ -272,6 +295,7 @@ pub fn wrap_after_tool_results(
                 let new_messages = ctx.new_messages.to_vec();
                 let context_snapshot = ctx.context.clone();
                 let inner = inner.clone();
+                let registry = Arc::clone(&registry);
                 Box::pin(async move {
                     let inner_update = match inner {
                         Some(hook) => {
@@ -293,10 +317,9 @@ pub fn wrap_after_tool_results(
                         .as_ref()
                         .and_then(|update| update.context.clone())
                         .unwrap_or(context_snapshot);
-                    context.messages.push(AgentMessage::User(UserMessage::new(
-                        UserContent::Text(reminder.message()),
-                        now_ms(),
-                    )));
+                    context
+                        .messages
+                        .push(register_and_build(reminder.message(), &registry));
 
                     Some(match inner_update {
                         Some(mut update) => {
@@ -522,63 +545,46 @@ mod tests {
     }
 
     #[test]
-    fn injected_messages_carry_the_marker_prefixes() {
-        // Contract: every injected reminder text MUST start with a
-        // REMINDER_PREFIXES marker — that is what `is_reminder_message` (and
-        // therefore compaction filtering / the never-persisted guarantee)
-        // keys on. Changing the wording without the marker breaks persistence
-        // exclusion; this test is the tripwire.
-        let status = Reminder::StatusCheck {
-            turn: 10,
-            interval: 10,
-        }
-        .message();
-        assert!(
-            REMINDER_PREFIXES.iter().any(|p| status.starts_with(p)),
-            "status text lost its marker: {status}"
-        );
-
-        let repeat = Reminder::RepeatCall {
-            tools: "`bash`".into(),
-            turns: 3,
-        }
-        .message();
-        assert!(
-            REMINDER_PREFIXES.iter().any(|p| repeat.starts_with(p)),
-            "repeat text lost its marker: {repeat}"
-        );
-    }
-
-    #[test]
-    fn is_reminder_message_recognizes_markers_and_rejects_plain_users() {
+    fn identity_is_by_injection_timestamp_not_text() {
         use rpi_agent::message::AgentMessage;
 
-        let reminder = AgentMessage::User(UserMessage::new(
-            UserContent::Text("[working-state check] Turn 4 of this run...".into()),
-            0,
+        // A user message that merely LOOKS like a reminder (asking what the
+        // notice means) must never be treated as transient — this was the
+        // prefix-filter bug the external review found. Identity keys on the
+        // injection timestamp registered at inject time, nothing else.
+        let lookalike = AgentMessage::User(UserMessage::new(
+            UserContent::Text(
+                "[repeat notice] 这条提示是什么意思?请帮我关闭重复提醒。".into(),
+            ),
+            123_456,
         ));
-        assert!(is_reminder_message(&reminder));
+        let registry = reminder_timestamps();
+        assert!(
+            !is_injected_reminder(&lookalike, &registry),
+            "a lookalike user message must be durable"
+        );
 
-        let repeat = AgentMessage::User(UserMessage::new(
+        // Register a timestamp, and only a message carrying THAT identity is
+        // transient — same text, different timestamp, stays durable.
+        let injected = AgentMessage::User(UserMessage::new(
             UserContent::Text("[repeat notice] You called bash...".into()),
-            0,
+            999,
         ));
-        assert!(is_reminder_message(&repeat));
+        registry.lock().unwrap().push(999);
+        assert!(is_injected_reminder(&injected, &registry));
 
-        let plain = AgentMessage::User(UserMessage::new(
-            UserContent::Text("normal user message".into()),
-            0,
+        let same_text_other_time = AgentMessage::User(UserMessage::new(
+            UserContent::Text("[repeat notice] You called bash...".into()),
+            1000,
         ));
-        assert!(!is_reminder_message(&plain));
+        assert!(
+            !is_injected_reminder(&same_text_other_time, &registry),
+            "same text without registered identity stays durable"
+        );
 
-        // Even a user message that merely MENTIONS the marker later in the
-        // text (e.g. quoting a reminder back) must not be excluded.
-        let quoted = AgentMessage::User(UserMessage::new(
-            UserContent::Text("about that [repeat notice] you sent".into()),
-            0,
-        ));
-        assert!(!is_reminder_message(&quoted),
-            "marker must match at the start, not anywhere");
+        // An empty registry (reminders disabled) matches nothing at all.
+        let empty = reminder_timestamps();
+        assert!(!is_injected_reminder(&injected, &empty));
     }
 
     use rpi_agent::types::AgentContext;
@@ -619,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn wrap_appends_the_reminder_after_the_inner_context() {
         let state = Arc::new(Mutex::new(WorkingStateReminder::new(1, false)));
-        let wrapped = wrap_after_tool_results(None, state);
+        let wrapped = wrap_after_tool_results(None, state, reminder_timestamps());
         let message = assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)]);
 
         let update = call_wrapped(&wrapped, &message)
@@ -640,7 +646,7 @@ mod tests {
         let inner: AfterToolResults = Arc::new(|_ctx: ShouldStopAfterTurnContext<'_>| {
             Box::pin(async { None })
         });
-        let wrapped = wrap_after_tool_results(Some(inner), state);
+        let wrapped = wrap_after_tool_results(Some(inner), state, reminder_timestamps());
         let message = assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)]);
         assert!(call_wrapped(&wrapped, &message).await.is_none());
     }
@@ -666,7 +672,7 @@ mod tests {
             })
         });
         let state = Arc::new(Mutex::new(WorkingStateReminder::new(1, false)));
-        let wrapped = wrap_after_tool_results(Some(inner), state);
+        let wrapped = wrap_after_tool_results(Some(inner), state, reminder_timestamps());
         let message = assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)]);
 
         let update = call_wrapped(&wrapped, &message)
