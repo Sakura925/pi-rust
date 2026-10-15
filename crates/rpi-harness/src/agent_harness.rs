@@ -3830,7 +3830,7 @@ impl AgentHarness {
         // below so the compaction hook and the reminder wrapper share it; it
         // stays empty (and the compaction filter becomes a no-op) unless the
         // reminders are enabled.
-        let reminder_registry = crate::working_state::reminder_timestamps();
+        let reminder_registry = crate::working_state::reminder_registry();
         let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
         let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
             if run_budget.lock().unwrap().is_enabled() {
@@ -4172,12 +4172,31 @@ impl AgentHarness {
             post_compaction_cut.store(0, Ordering::Release);
             // Prior tools and delivered context are durable. Rebuild after the
             // wait so any writes accepted during it are included as well.
-            let path = self.branch_path_oldest_first().await?;
+            // Early errors must NOT strand a held AgentEnd: flush it before
+            // returning (see DeferredAgentEndEmitter).
+            let path = match self.branch_path_oldest_first().await {
+                Ok(path) => path,
+                Err(error) => {
+                    if let Some(deferred) = &deferred_end {
+                        deferred.flush(Vec::new()).await;
+                    }
+                    return Err(error);
+                }
+            };
             agent_context.messages = build_session_context(&path, &build_opts).messages;
         };
 
-        if let Some(error) = context_write_error.lock().unwrap().take() {
+        // Take the error out in a separate statement: the `MutexGuard` must
+        // drop before the flush's await below (a guard held across an await
+        // makes the whole future non-Send).
+        let context_error = context_write_error.lock().unwrap().take();
+        if let Some(error) = context_error {
             // Keep the operation's recovery frames and context enqueue intact.
+            // Flush any held AgentEnd first: an error return must never leave
+            // consumers stuck in the Working state (see DeferredAgentEndEmitter).
+            if let Some(deferred) = &deferred_end {
+                deferred.flush(Vec::new()).await;
+            }
             return Err(HarnessError::io(error));
         }
 
@@ -4186,9 +4205,20 @@ impl AgentHarness {
             Ok(new_messages) => {
                 let cut = post_compaction_cut.load(Ordering::Acquire);
                 let start = cut.min(new_messages.len());
-                let (leaf, final_id) = self
+                let (leaf, final_id) = match self
                     .persist_new_messages(&new_messages[start..], start, &settle_state)
-                    .await?;
+                    .await
+                {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        // The run's own terminal event must still reach
+                        // consumers even when persistence fails.
+                        if let Some(deferred) = &deferred_end {
+                            deferred.flush(Vec::new()).await;
+                        }
+                        return Err(error);
+                    }
+                };
                 // A budget stop ends the run "Completed" (the loop's normal exit
                 // path), which would otherwise look like a finished task. Record
                 // *why* it stopped so the user sees it in the transcript and the
