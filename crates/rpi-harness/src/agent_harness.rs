@@ -52,7 +52,8 @@ use rpi_ai::types::{
 use rpi_ai::{Model, Provider as AiProvider};
 
 use crate::compaction::{
-    compact, estimate_context_tokens, prepare_compaction, should_compact, CompactionLlmOptions,
+    compact, complete_simple_with_retries, estimate_context_tokens, prepare_compaction,
+    should_compact, CompactionLlmOptions,
 };
 use crate::error::{SessionError, SessionErrorCode};
 use crate::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent};
@@ -591,6 +592,17 @@ pub struct PendingResume {
 /// every startup: an unbounded loop that spends tokens and repeats side
 /// effects while the user only ever sees a crash.
 pub const MAX_RESUME_ATTEMPTS: u32 = 3;
+
+/// Timeout for the budgeted handoff summary call (`budget_handoff_summary`).
+/// Short by design: the handoff is best-effort, and a hanging provider must
+/// not hold the run open beyond this — the deterministic `runBudget` notice
+/// is the backstop.
+pub const HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Output cap (tokens) for the budgeted handoff summary call. Enough for a
+/// "done / remains / next step" handoff, far below normal `max_tokens`, so the
+/// extra call cannot turn into another long generation.
+pub const HANDOFF_MAX_TOKENS: u64 = 4096;
 
 /// Shared mutable state. Cloned out (field-by-field) at the start of each
 /// operation so the loop sees a consistent snapshot; setters replace fields
@@ -3920,7 +3932,7 @@ impl AgentHarness {
         // Mirrors upstream's `openFrameProgress`. See
         // `docs/debugging/llm-repetition-forensics.md` §十一.
         let frame_recorder = Arc::new(crate::frame_progress::FrameRecordingEmitter::new(
-            base_emitter,
+            Arc::clone(&base_emitter),
             self.session.clone(),
             self.lane.clone(),
             run_id.clone(),
@@ -4079,6 +4091,54 @@ impl AgentHarness {
                 // whole run future non-`Send`.
                 let budget_stop = run_budget.lock().unwrap().stop();
                 if let Some(stop) = budget_stop {
+                    // Bounded handoff: before the deterministic truncation
+                    // notice, give the model ONE last tool-free, output-capped
+                    // summary call so the transcript ends with "done / remains /
+                    // next step" instead of a bare cut. Best effort by design:
+                    // any failure (no provider, aborted, provider error, empty
+                    // reply) falls through to the notice below, which is the
+                    // guaranteed backstop. See `budget_handoff_summary`.
+                    if let Some(summary) = self
+                        .budget_handoff_summary(
+                            &stop,
+                            &snap.model,
+                            &snap.models,
+                            &new_messages[start..],
+                            &signal,
+                        )
+                        .await
+                    {
+                        let agent_message = AgentMessage::Assistant(Box::new(summary));
+                        match self
+                            .session
+                            .view(&self.lane)
+                            .append_message(agent_message.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                // Surface the handoff in the live transcript.
+                                // Emit through the raw emitter on purpose: the
+                                // settling/frame wrappers are loop machinery
+                                // (entry reservation, progress frames) that a
+                                // harness-side append must not re-trigger.
+                                base_emitter
+                                    .emit(AgentEvent::MessageStart {
+                                        message: agent_message.clone(),
+                                    })
+                                    .await;
+                                base_emitter
+                                    .emit(AgentEvent::MessageEnd {
+                                        message: agent_message,
+                                    })
+                                    .await;
+                            }
+                            Err(error) => tracing::warn!(
+                                lane = %self.lane,
+                                %error,
+                                "could not persist the budget handoff summary"
+                            ),
+                        }
+                    }
                     let notice = crate::messages::create_custom_message(
                         "runBudget",
                         UserContent::Text(stop.message()),
@@ -4213,6 +4273,101 @@ impl AgentHarness {
         }
 
         Ok(RunResult { run_id, outcome })
+    }
+
+    /// Bounded handoff for a budget-stopped run: ONE extra assistant call,
+    /// tool-free, output-capped (`HANDOFF_MAX_TOKENS`) and time-capped
+    /// (`HANDOFF_TIMEOUT`), that turns the truncation into a handoff summary
+    /// (done / remains / next step). Persists nothing and emits nothing — the
+    /// caller appends the returned message and emits it through the raw
+    /// emitter. Returns `None` on any failure (no provider, cancelled signal,
+    /// provider error/abort, empty reply): the deterministic `runBudget`
+    /// notice is the backstop, so a failed handoff must never extend the run
+    /// or surface as a second error.
+    ///
+    /// Context is rebuilt from the durable branch path plus this run's
+    /// not-yet-persisted messages (`run_messages` = `new_messages[cut..]`),
+    /// which mirrors what the *next* run will see after persistence — a
+    /// mid-run compaction cut is respected rather than replaying the
+    /// compacted turns.
+    async fn budget_handoff_summary(
+        &self,
+        stop: &crate::run_budget::BudgetStop,
+        model: &Model,
+        providers: &[Arc<dyn AiProvider>],
+        run_messages: &[AgentMessage],
+        signal: &CancellationToken,
+    ) -> Option<AssistantMessage> {
+        if signal.is_cancelled() {
+            return None;
+        }
+        let provider = Self::resolve_provider(providers, model)
+            .map_err(|error| tracing::warn!(%error, "budget handoff: no provider"))
+            .ok()?;
+
+        let path = self
+            .branch_path_oldest_first()
+            .await
+            .map_err(|error| tracing::warn!(%error, "budget handoff: could not rebuild branch path"))
+            .ok()?;
+        let mut messages: Vec<AgentMessage> = path
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::session::types::Entry::Message(message_entry) => {
+                    Some(message_entry.message)
+                }
+                _ => None,
+            })
+            .collect();
+        messages.extend(run_messages.iter().cloned());
+
+        let (turns, limit) = match stop {
+            crate::run_budget::BudgetStop::TurnLimit { turns, limit } => (*turns, *limit),
+        };
+        let instruction = format!(
+            "This run has reached its turn budget ({turns} turns, limit {limit}) and is now \
+             ending. Write a concise handoff summary for the next session: (1) what was \
+             completed, (2) what remains, (3) the recommended next step. Reply with text \
+             only \u{2014} do not call tools."
+        );
+        messages.push(AgentMessage::User(UserMessage::new(
+            UserContent::Text(instruction),
+            now_ms(),
+        )));
+
+        let context = rpi_ai::types::Context {
+            system_prompt: Some(
+                "You are a coding agent writing an end-of-run handoff summary. \
+                 Be concise and concrete \u{2014} name files, commands and outcomes."
+                    .to_string(),
+            ),
+            messages: harness_convert_to_llm(messages),
+            tools: Vec::new(),
+        };
+
+        let options = rpi_ai::SimpleStreamOptions {
+            timeout: Some(HANDOFF_TIMEOUT),
+            max_tokens: Some(HANDOFF_MAX_TOKENS),
+            signal: signal.clone(),
+            // Standalone request: no retry (the notice below is the
+            // backstop), no cache write, thinking disabled.
+            ..Default::default()
+        };
+        let response =
+            complete_simple_with_retries(provider, model.clone(), context, options, None).await;
+        if matches!(response.stop_reason, StopReason::Error | StopReason::Aborted) {
+            tracing::warn!(
+                reason = ?response.stop_reason,
+                error = response.error_message.as_deref().unwrap_or(""),
+                "budget handoff summary failed; keeping the truncation notice"
+            );
+            return None;
+        }
+        if Content::text_only(&response.content, "\n").trim().is_empty() {
+            tracing::warn!("budget handoff summary was empty; keeping the truncation notice");
+            return None;
+        }
+        Some(response)
     }
 
     /// Explicit compaction. Drives `prepare_compaction` + `compact` and

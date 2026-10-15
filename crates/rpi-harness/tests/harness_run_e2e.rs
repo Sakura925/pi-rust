@@ -961,9 +961,18 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN.to_string(),
     );
 
+    // A model that never stops asking for tools: exactly `ceiling` scripted
+    // tool-call turns, then ONE scripted text reply consumed by the bounded
+    // handoff summary call that follows the budget stop. If the guard somehow
+    // failed to stop the run, the 121st turn would consume the text reply and
+    // end the run "normally" — which the notice assertion below catches (no
+    // notice would be recorded).
+    let ceiling = rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN as usize;
     let script = FauxScript::new();
     let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
-    script.set_responses((0..200).map(|_| step()).collect());
+    let mut steps: Vec<FauxStep> = (0..ceiling).map(|_| step()).collect();
+    steps.push(FauxStep::text("handoff: completed A; remains B; next C"));
+    script.set_responses(steps);
     let (harness, provider, _env) = harness_with(script).await;
 
     let result = harness
@@ -983,10 +992,11 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         .state()
         .call_count
         .load(std::sync::atomic::Ordering::Relaxed);
-    let ceiling = rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN as usize;
+    // `ceiling` loop turns + exactly ONE bounded handoff summary call.
     assert_eq!(
-        calls, ceiling,
-        "the run must stop exactly at the turn ceiling, not run on"
+        calls,
+        ceiling + 1,
+        "the run must stop exactly at the turn ceiling, plus one handoff summary call"
     );
 
     // The stop reason is on the lane, rendered like any other custom message.
@@ -1041,6 +1051,43 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         notices.len(),
         1,
         "exactly one budget notice must be recorded; got {notices:?}"
+    );
+
+    // The bounded handoff: ONE tool-free summary assistant message, persisted
+    // BEFORE the deterministic notice, so the transcript reads "handoff, then
+    // why it stopped" and the next run's context includes the handoff.
+    let handoff_position = path.iter().position(|entry| match entry {
+        rpi_harness::session::types::Entry::Message(message_entry) => {
+            match &message_entry.message {
+                rpi_agent::AgentMessage::Assistant(assistant) => {
+                    rpi_ai::types::Content::text_only(&assistant.content, "\n")
+                        .contains("handoff: completed")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    });
+    let notice_position = path.iter().position(|entry| match entry {
+        rpi_harness::session::types::Entry::Message(message_entry) => {
+            match &message_entry.message {
+                rpi_agent::AgentMessage::Custom(custom)
+                    if custom.role == rpi_harness::messages::CUSTOM_ROLE =>
+                {
+                    custom
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, rpi_ai::types::Content::Text(text) if text.text.contains("Stopped after")))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    });
+    assert!(
+        matches!((handoff_position, notice_position), (Some(h), Some(n)) if h < n),
+        "a handoff summary must be persisted before the budget notice; \
+         handoff at {handoff_position:?}, notice at {notice_position:?}"
     );
 
     // Restore the process-wide switch (see the opt-in above).
