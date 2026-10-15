@@ -49,6 +49,8 @@ mod rendering;
 use rendering::*;
 mod panels;
 mod pet;
+mod thinking_peek;
+use thinking_peek::ThinkingPeek;
 
 #[cfg(test)]
 mod tests;
@@ -1381,6 +1383,7 @@ pub async fn interactive_tui(
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
+        thinking_peek: ThinkingPeek::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),

@@ -186,6 +186,14 @@ pub(super) async fn handle_agent_event(
             // Finalize any still-streaming assistant message.
             state.transcript_view().finalize_assistant();
             state.set_status(RunStatus::Idle);
+            // Thinking peek：任务收尾，恢复原生 "Thinking..." 标签
+            // （pi-open-tui 的 restore 行为）。
+            state.thinking_peek.reset();
+            if state.hide_thinking() {
+                if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
+                    comp.set_hidden_thinking_label(super::thinking_peek::NATIVE_LABEL);
+                }
+            }
             // Flush any `!command` results that completed mid-run: the run's
             // tool sequence is closed, so appending now keeps transcript order
             // intact (upstream's `flushPendingBashMessages`).
@@ -312,6 +320,30 @@ pub(super) async fn handle_agent_event(
             // A freshly-created bash panel hides the global `Working…` loader.
             state.sync_working_loader_with_bash();
             *state.last_assistant_text.lock().unwrap() = text;
+            // Thinking peek（pi-open-tui peek.ts 移植）：hide-thinking 开启时
+            // 用推理尾部一行替换静态 "Thinking..." 标签；仅在 label 实际变化
+            // 时重建组件（避免每 delta 的 O(n) 重建）。
+            if state.hide_thinking() {
+                let thinking: String = a
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        rpi_ai::types::Content::Thinking(t) => Some(t.thinking.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let has_text = a.content.iter().any(|c| {
+                    matches!(c, rpi_ai::types::Content::Text(t) if !t.text.trim().is_empty())
+                });
+                if let Some(label) =
+                    state.thinking_peek.update(&thinking, has_text, tui.width())
+                {
+                    if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
+                        comp.set_hidden_thinking_label(&label);
+                    }
+                }
+            }
             tui.request_render(false);
         }
 
@@ -321,6 +353,14 @@ pub(super) async fn handle_agent_event(
                 state
                     .transcript_view()
                     .finalize_assistant_blocks(&assistant_blocks(a));
+                // Thinking peek：消息收尾，thinking 阶段落定为 ✓。
+                if state.hide_thinking() {
+                    if let Some(label) = state.thinking_peek.settle(tui.width()) {
+                        if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
+                            comp.set_hidden_thinking_label(&label);
+                        }
+                    }
+                }
                 // Cache the finalized text for `/copy`.
                 if !text.is_empty() {
                     *state.last_assistant_text.lock().unwrap() = text;

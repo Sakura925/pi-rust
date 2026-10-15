@@ -168,6 +168,9 @@ pub(super) struct TuiState {
     /// Whether package/custom themes may be selected in this session.
     /// Persisted display preference toggled by Ctrl+T (shared with the view).
     pub(super) hide_thinking: Arc<std::sync::Mutex<bool>>,
+    /// Thinking-peek 状态机（pi-open-tui peek 移植）：hide-thinking 时用推理
+    /// 尾部一行替换静态的 "Thinking..." 标签。
+    pub(super) thinking_peek: ThinkingPeek,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
     /// the view).
     pub(super) tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
