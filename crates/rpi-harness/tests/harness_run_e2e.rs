@@ -1193,6 +1193,149 @@ async fn no_turn_ceiling_by_default_matches_native_pi() {
     }
 }
 
+/// Working-state reminders (`RPI_WORKING_STATE_INTERVAL`) are opt-in like the
+/// run budget: when enabled, the injected check message must ride the loop
+/// without breaking it — the run still completes, the injection does NOT add a
+/// provider call, and (by design) the reminder is never persisted onto the
+/// branch: the model's *reply* is the durable state, not the nudge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn working_state_check_rides_the_run_without_breaking_it() {
+    let previous = std::env::var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV).ok();
+    let previous_repeat =
+        std::env::var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV).ok();
+    std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, "2");
+    std::env::remove_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV);
+
+    // Two tool turns (the 2nd fires the check), then a final plain answer.
+    let script = FauxScript::new();
+    let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
+    let mut steps: Vec<FauxStep> = (0..2).map(|_| step()).collect();
+    steps.push(FauxStep::text("done"));
+    script.set_responses(steps);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("run with working-state checks", vec![])
+        .await
+        .expect("the run must complete");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    // The injection changes the CONTEXT, not the request count: 2 tool turns
+    // + 1 final text turn = 3 calls.
+    let calls = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(calls, 3, "the reminder must not add a provider call");
+
+    // The reminder message itself is transient: nothing containing the
+    // check marker may land on the durable branch.
+    let leaf = harness
+        .session()
+        .get_leaf_id()
+        .await
+        .expect("leaf")
+        .expect("leaf present");
+    let path = harness
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("branch path");
+    let persisted_markers = path
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message_entry) => {
+                Some(&message_entry.message)
+            }
+            _ => None,
+        })
+        .filter(|message| {
+            serde_json::to_string(message)
+                .map(|json| json.contains("[working-state check]"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        persisted_markers, 0,
+        "the reminder must stay transient (not persisted)"
+    );
+
+    match &previous {
+        Some(value) => {
+            std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, value)
+        }
+        None => std::env::remove_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV),
+    }
+    match &previous_repeat {
+        Some(value) => {
+            std::env::set_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV, value)
+        }
+        None => std::env::remove_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV),
+    }
+}
+
+/// The repeat-call notice (`RPI_REPEAT_TOOL_REMINDER`) fires when the same
+/// tool call repeats 3 turns in a row, but it is a nudge, never a stop: the
+/// run continues and the loop still ends only when the model stops asking for
+/// tools.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeat_call_notice_nudges_without_stopping_the_run() {
+    let previous = std::env::var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV).ok();
+    let previous_interval =
+        std::env::var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV).ok();
+    std::env::set_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV, "1");
+    std::env::remove_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV);
+
+    // Four IDENTICAL tool turns (the 3rd fires the notice, the streak resets),
+    // then a final plain answer.
+    let script = FauxScript::new();
+    let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
+    let mut steps: Vec<FauxStep> = (0..4).map(|_| step()).collect();
+    steps.push(FauxStep::text("done"));
+    script.set_responses(steps);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("run with a repeat notice", vec![])
+        .await
+        .expect("the run must complete");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let calls = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(calls, 5, "the notice must not stop the run early");
+
+    match &previous {
+        Some(value) => {
+            std::env::set_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV, value)
+        }
+        None => std::env::remove_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV),
+    }
+    match &previous_interval {
+        Some(value) => {
+            std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, value)
+        }
+        None => std::env::remove_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV),
+    }
+}
+
 /// A crash mid-stream must not cost the whole run.
 ///
 /// Before frame progress, a run persisted nothing until it finished, so killing

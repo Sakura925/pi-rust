@@ -30,3 +30,4 @@ pub mod system_prompt;
 pub mod tool_recovery;
 pub mod types;
 pub mod watcher;
+pub mod working_state;

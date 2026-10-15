@@ -3911,6 +3911,19 @@ impl AgentHarness {
             signal.clone(),
             Arc::clone(&context_write_error),
         ));
+        // Working-state reminders (status checks every N tool turns, repeat-call
+        // notices) wrap the chain OUTERMOST so a reminder survives a same-turn
+        // compaction/delivery and always reaches the next request. Off unless
+        // `RPI_WORKING_STATE_INTERVAL` / `RPI_REPEAT_TOOL_REMINDER` opts in —
+        // upstream has no such injection, so default behaviour is unchanged.
+        let working_state =
+            Arc::new(Mutex::new(crate::working_state::WorkingStateReminder::from_env()));
+        if working_state.lock().unwrap().is_enabled() {
+            let state = Arc::clone(&working_state);
+            let inner = config.after_tool_results.take();
+            config.after_tool_results =
+                Some(crate::working_state::wrap_after_tool_results(inner, state));
+        }
         config.prepare_next_turn = Some(self.context_boundary_hook(
             None,
             Arc::clone(&settle_state),
