@@ -134,6 +134,80 @@ struct DelegateTool {
 struct StreamState {
     lines: Vec<String>,
     last_flush: Option<Instant>,
+    /// The sub-agent's CURRENT activity, derived from the json event stream:
+    /// "执行 read（path…）" / "思考中…" / streaming text tail. Drives the
+    /// delegate panel's live activity line.
+    activity: String,
+    /// The assistant's final text, accumulated from `message_end` events.
+    /// The tool's result when the run completes.
+    final_text: String,
+}
+
+impl StreamState {
+    fn record_event(&mut self, line: &str) {
+        self.lines.push(line.to_string());
+        // Best-effort JSON event projection: enough of the `RemoteEvent`
+        // shape to keep the panel honest about what the sub-agent is doing.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        let event_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match event_type {
+            "tool_execution_start" => {
+                let tool = value
+                    .get("toolName")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("tool");
+                self.activity = format!("执行 {tool}");
+            }
+            "message_update" => {
+                let kind = value
+                    .get("eventType")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if kind.contains("thinking") {
+                    // Never leak reasoning content — presence only.
+                    self.activity = "思考中…".to_string();
+                } else if let Some(delta) = value.get("delta").and_then(|d| d.as_str()) {
+                    if !delta.trim().is_empty() {
+                        let tail = delta
+                            .lines()
+                            .rev()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("");
+                        self.activity = format!("正在输出：{}", tail.trim());
+                    }
+                }
+            }
+            "message_end" => {
+                // Assistant text from the message body — the sub-agent's answer.
+                let text = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| {
+                                (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                                    .then(|| b.get("text").and_then(|t| t.as_str()))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    self.final_text = text;
+                }
+                self.activity.clear();
+            }
+            "turn_start" => {
+                self.activity = "新轮次开始".to_string();
+            }
+            _ => {}
+        }
+    }
 }
 
 #[async_trait]
@@ -224,6 +298,8 @@ impl AgentTool for DelegateTool {
         command
             .arg("-p")
             .arg(&input.task)
+            .arg("--mode")
+            .arg("json")
             .arg("--append-system-prompt")
             .arg(&system_prompt)
             .current_dir(&cwd)
@@ -294,29 +370,36 @@ impl AgentTool for DelegateTool {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 let mut guard = reader_state.lock().unwrap();
-                guard.lines.push(line);
+                guard.record_event(&line);
                 let should_flush = guard
                     .last_flush
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(DELEGATE_UPDATE_THROTTLE_MS));
                 if should_flush {
                     guard.last_flush = Some(Instant::now());
-                    let tail: Vec<String> =
-                        guard.lines.iter().rev().take(PARTIAL_TAIL_LINES).cloned().collect();
+                    // The partial payload is the CURRENT ACTIVITY — what the
+                    // sub-agent is doing right now — not a dump of raw stdout:
+                    // `-p --mode json` only emits events, and the panel's live
+                    // line exists precisely to show "执行 read / 思考中…".
+                    let activity = guard.activity.clone();
                     drop(guard);
-                    let text = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                    update_counter.fetch_add(1, Ordering::Relaxed);
-                    on_update(AgentToolResult {
-                        content: vec![TextContentOrImage::Text(TextContent {
-                            kind: Default::default(),
-                            text,
-                            text_signature: None,
-                        })],
-                        details: serde_json::json!({"partial": true}),
-                        usage: None,
-                        added_tool_names: Vec::new(),
-                        terminate: false,
-                    });
+                    if !activity.is_empty() {
+                        update_counter.fetch_add(1, Ordering::Relaxed);
+                        on_update(AgentToolResult {
+                            content: vec![TextContentOrImage::Text(TextContent {
+                                kind: Default::default(),
+                                text: activity,
+                                text_signature: None,
+                            })],
+                            details: serde_json::json!({"partial": true}),
+                            usage: None,
+                            added_tool_names: Vec::new(),
+                            terminate: false,
+                        });
+                    }
                 }
             }
         });
@@ -348,9 +431,16 @@ impl AgentTool for DelegateTool {
         // Give the readers a moment to drain the pipes after process exit.
         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), stderr_reader).await;
+        // Prefer the sub-agent's final answer (extracted from `message_end`
+        // events) over the raw event-line dump; fall back to the raw lines
+        // when no text block ever landed (e.g. an early crash).
         let final_output = {
             let guard = state.lock().unwrap();
-            guard.lines.join("\n")
+            if guard.final_text.trim().is_empty() {
+                guard.lines.join("\n")
+            } else {
+                guard.final_text.clone()
+            }
         };
         let stderr_tail = {
             let tail = stderr_state.lock().unwrap();

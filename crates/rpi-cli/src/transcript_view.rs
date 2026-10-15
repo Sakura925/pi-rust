@@ -441,6 +441,7 @@ impl TranscriptView {
             if let Some(skill) = skill_tool_name(name, args) {
                 comp.set_skill_name(skill);
             }
+            apply_delegate_info(&comp, name, args);
             comp.set_expanded(self.expanded());
             comp.set_running();
             self.chat.add_child(comp.clone());
@@ -482,7 +483,10 @@ impl TranscriptView {
                     comp.set_args(&args.to_string());
                 }
                 if tool_update_has_payload(&text, result) {
-                    comp.set_result(&text, false);
+                    // A partial update must NOT end the run: set_result flips
+                    // the panel to ✓, freezes the elapsed timer, and makes
+                    // has_running_tool() lie. Only ToolEnd settles the outcome.
+                    comp.set_partial_result(&text);
                     if !ask_user {
                         apply_edit_diff(&comp, name, result.get("details"), width);
                     }
@@ -504,9 +508,10 @@ impl TranscriptView {
                     if let Some(skill) = skill_tool_name(name, args) {
                         comp.set_skill_name(skill);
                     }
+                    apply_delegate_info(&comp, name, args);
                     comp.set_expanded(self.expanded());
                     comp.set_running();
-                    comp.set_result(&text, false);
+                    comp.set_partial_result(&text);
                     if !ask_user {
                         apply_edit_diff(&comp, name, result.get("details"), width);
                     }
@@ -581,6 +586,16 @@ impl TranscriptView {
         };
         comp.set_result(&text, is_error);
         if !ask_user {
+            if let ("delegate", Some(outcome)) = (
+                name,
+                details
+                    .and_then(|d| d.get("outcome"))
+                    .and_then(Value::as_str),
+            ) {
+                // Four-way terminal state: completed / failed / timeout /
+                // cancelled — the panel reads this instead of assuming ✓.
+                comp.set_delegate_outcome(outcome);
+            }
             if tool_result_requests_markdown(details) {
                 comp.set_result_markdown(true);
             }
@@ -779,6 +794,26 @@ pub fn tool_result_requests_markdown(details: Option<&Value>) -> bool {
 /// The skill name when `tool_name` is a `read` of a `SKILL.md` file (the
 /// `SKILL.md` parent directory's basename), else `None`. A skill read renders
 /// as upstream's `[skill] <name>` box.
+/// Wire a `delegate` tool panel into delegate display mode: the fixed
+/// `agent · model · status/elapsed` header replaces the unstable
+/// first-field-of-args summary. Called from tool_start / tool_update when the
+/// component is created.
+fn apply_delegate_info(
+    comp: &Arc<ToolExecutionComponent>,
+    tool_name: &str,
+    args: &Value,
+) {
+    if tool_name != "delegate" {
+        return;
+    }
+    let agent = args
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or("sub-agent");
+    let model = args.get("model").and_then(Value::as_str);
+    comp.set_delegate_info(agent, model);
+}
+
 pub fn skill_tool_name(tool_name: &str, args: &Value) -> Option<String> {
     if tool_name != "read" {
         return None;

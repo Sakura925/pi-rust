@@ -37,6 +37,18 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// Delegate-panel payload (see [`ToolExecutionComponent::set_delegate_info`]).
+#[derive(Debug, Clone)]
+struct DelegateInfo {
+    /// The agent name from the tool call (e.g. `luna-delegation-agent`).
+    agent: String,
+    /// The model the sub-agent runs on, when declared.
+    model: Option<String>,
+    /// The terminal outcome (`completed` / `failed` / `timeout` / `cancelled`),
+    /// set at ToolEnd from the result's `details.outcome`.
+    outcome: Option<String>,
+}
+
 /// Component that displays a tool execution.
 ///
 /// Mirrors TypeScript ToolExecutionComponent class (simplified).
@@ -51,6 +63,16 @@ pub struct ToolExecutionComponent {
     /// collapses to a single line and expands to the full skill markdown
     /// content (the `read` result). Mirrors pi's `SkillInvocationMessageComponent`.
     skill_name: Mutex<Option<String>>,
+    /// Delegate-panel mode (delegate_task): renders a codex-style compact
+    /// panel — fixed `agent · model · status/elapsed` header, a one-line task
+    /// brief, a live activity line while running, and a four-way outcome
+    /// (completed / failed / timeout / cancelled) instead of a blanket ✓.
+    delegate_info: Mutex<Option<DelegateInfo>>,
+    /// The latest partial (streaming) result. Tracked separately from
+    /// `result` so a ToolUpdate can refresh the visible text without ending
+    /// the run (a partial must keep status Running and the elapsed timer
+    /// alive).
+    partial_activity: Mutex<String>,
     /// Tool arguments (displayed)
     args: Mutex<String>,
     /// Tool result (displayed after execution)
@@ -101,6 +123,8 @@ impl ToolExecutionComponent {
             name: Mutex::new(name.to_string()),
             display_title: Mutex::new(None),
             skill_name: Mutex::new(None),
+            delegate_info: Mutex::new(None),
+            partial_activity: Mutex::new(String::new()),
             args: Mutex::new(args.to_string()),
             result: Mutex::new(None),
             status: Mutex::new(ToolStatus::Pending),
@@ -199,6 +223,42 @@ impl ToolExecutionComponent {
     pub fn set_skill_name(&self, name: impl Into<String>) {
         if let Ok(mut skill_name) = self.skill_name.lock() {
             *skill_name = Some(name.into());
+        }
+        self.bump();
+    }
+
+    /// Record a streaming (partial) result WITHOUT ending the run: the status
+    /// stays Running and the elapsed timer keeps advancing. This is what a
+    /// `ToolUpdate` payload should use — a partial that flips the panel to
+    /// ✓ freezes the timer and lies about completion.
+    pub fn set_partial_result(&self, activity: &str) {
+        if let Ok(mut partial) = self.partial_activity.lock() {
+            *partial = activity.to_string();
+        }
+        self.bump();
+    }
+
+    /// Switch the panel into delegate mode (delegate_task): fixed
+    /// `agent · model · status/elapsed` header, one-line task brief, live
+    /// activity line, and a four-way outcome instead of a blanket ✓.
+    pub fn set_delegate_info(&self, agent: &str, model: Option<&str>) {
+        if let Ok(mut info) = self.delegate_info.lock() {
+            *info = Some(DelegateInfo {
+                agent: agent.to_string(),
+                model: model.map(|m| m.to_string()),
+                outcome: None,
+            });
+        }
+        self.bump();
+    }
+
+    /// Record the delegate outcome (completed / failed / timeout /
+    /// cancelled). Unknown values render as the raw label in muted styling.
+    pub fn set_delegate_outcome(&self, outcome: &str) {
+        if let Ok(mut info) = self.delegate_info.lock() {
+            if let Some(info) = info.as_mut() {
+                info.outcome = Some(outcome.to_string());
+            }
         }
         self.bump();
     }
@@ -404,6 +464,38 @@ impl Component for ToolExecutionComponent {
         if let Some(skill) = skill_name.as_deref() {
             let content = result.as_deref().unwrap_or("");
             let lines = render_skill(&colors, skill, content, *expanded, width);
+            if finished {
+                if let Ok(mut cache) = self.cache.lock() {
+                    *cache = Some(ToolRenderCache {
+                        width,
+                        revision,
+                        theme_revision,
+                        lines: lines.clone(),
+                    });
+                }
+            }
+            return lines;
+        }
+
+        // Delegate-panel mode: codex-style compact panel — the fixed identity
+        // header (`agent · model · status/elapsed`) stays stable across updates,
+        // the task brief shows on its own line, a live activity line streams
+        // while running, and the terminal state distinguishes
+        // completed/failed/timeout/cancelled instead of a blanket ✓.
+        if let Some(info) = self.delegate_info.lock().unwrap().clone() {
+            let activity = self.partial_activity.lock().unwrap().clone();
+            let lines = render_delegate(
+                &colors,
+                &info,
+                &status,
+                args.as_str(),
+                result.as_deref().unwrap_or(""),
+                &activity,
+                &*started_at,
+                &*finished_at,
+                *expanded,
+                width,
+            );
             if finished {
                 if let Ok(mut cache) = self.cache.lock() {
                     *cache = Some(ToolRenderCache {
@@ -638,6 +730,144 @@ impl Component for ToolExecutionComponent {
 /// `[skill] <name> (Ctrl+O to expand)`; expanded it shows the `[skill]` label,
 /// the bold skill name, then the full skill markdown content (the `read`
 /// result) rendered with the standard markdown component.
+/// Render the delegate panel (codex-style compact layout, no background).
+///
+/// Running:
+/// ```text
+/// ● luna · gpt-5.6-luna · 23s
+///   检查子进程清理
+///   正在读取 delegate.rs
+/// ```
+/// Finished — four distinct outcomes instead of a blanket ✓:
+/// ```text
+/// ✓ luna · 42s
+///   子任务已完成 · Ctrl+O 展开结果
+/// ```
+fn render_delegate(
+    colors: &ThemeColors,
+    info: &DelegateInfo,
+    status: &ToolStatus,
+    args_json: &str,
+    result: &str,
+    activity: &str,
+    started_at: &Option<Instant>,
+    finished_at: &Option<Instant>,
+    expanded: bool,
+    width: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.push(String::new());
+
+    // The identity header: glyph + agent · model? · elapsed.
+    let (glyph, glyph_color) = match (status, info.outcome.as_deref()) {
+        (ToolStatus::Running, _) => ("●", colors.accent),
+        (ToolStatus::Completed, Some("timeout")) => ("⏱", colors.warning),
+        (ToolStatus::Completed, Some("cancelled")) => ("⊘", colors.warning),
+        (ToolStatus::Failed, _) => ("✗", colors.error),
+        (ToolStatus::Pending, _) => ("●", colors.muted),
+        (ToolStatus::Completed, Some("failed")) => ("✗", colors.error),
+        (ToolStatus::Completed, _) => ("✓", colors.success),
+    };
+    let elapsed = match (*started_at, *finished_at) {
+        (Some(start), Some(end)) => format_elapsed(end.duration_since(start)),
+        (Some(start), None) => format_elapsed(start.elapsed()),
+        _ => String::new(),
+    };
+    let mut header_parts = vec![info.agent.clone()];
+    if let Some(model) = info.model.as_deref() {
+        header_parts.push(model.to_string());
+    }
+    if !elapsed.is_empty() {
+        header_parts.push(elapsed);
+    }
+    let header = format!(
+        "{} {}",
+        glyph_color.fg(glyph),
+        colors.dim.fg(&header_parts.join(" · ")),
+    );
+    out.push(truncate_to_width(&header, width, "…"));
+
+    // One-line task brief from the tool arguments.
+    let brief = delegate_task_brief(args_json);
+    if !brief.is_empty() {
+        let brief_line = format!("  {}", colors.muted.fg(&truncate_to_width(
+            &brief,
+            width.saturating_sub(2).max(1),
+            "…",
+        )));
+        out.push(brief_line);
+    }
+
+    if *status == ToolStatus::Running {
+        // Live activity line — what the sub-agent is doing right now.
+        if !activity.trim().is_empty() {
+            let activity_line = format!(
+                "  {}",
+                colors.dim.fg(&truncate_to_width(
+                    activity.trim(),
+                    width.saturating_sub(2).max(1),
+                    "…"
+                ))
+            );
+            out.push(activity_line);
+        }
+        return out;
+    }
+
+    // Finished — compact by default, full markdown when expanded.
+    if !expanded {
+        let label = match info.outcome.as_deref() {
+            Some("timeout") => "子任务超时".to_string(),
+            Some("cancelled") => "已取消".to_string(),
+            Some("failed") => "子任务失败".to_string(),
+            _ => "子任务已完成".to_string(),
+        };
+        let line = format!(
+            "  {}",
+            colors
+                .dim
+                .fg(&format!("{label} · Ctrl+O 展开结果"))
+        );
+        out.push(truncate_to_width(&line, width, "…"));
+        return out;
+    }
+
+    // Expanded: the args summary, then the sub-agent's report rendered as
+    // markdown in ordinary transcript flow (no background tint).
+    if !args_json.trim().is_empty() {
+        let args_line = format!(
+            "  {}",
+            colors.dim.fg(&truncate_to_width(
+                args_json,
+                width.saturating_sub(2).max(1),
+                "…"
+            ))
+        );
+        out.push(args_line);
+    }
+    if !result.trim().is_empty() {
+        let body_width = width.saturating_sub(2).max(1);
+        let md = crate::markdown::Markdown::new(result.to_string(), 0, 0);
+        for md_line in md.render(body_width) {
+            out.push(truncate_to_width(&format!("  {md_line}"), width, "…"));
+        }
+    }
+    out
+}
+
+/// Extract the one-line task brief from the delegate tool's args. Works on
+/// both complete and still-streaming JSON via the panel's existing
+/// `extract_string_field` fallback matcher.
+fn delegate_task_brief(args_json: &str) -> String {
+    let task = crate::tool_execution::tools::extract_string_field(args_json, "task");
+    // First line of the brief, whitespace-normalized.
+    let first = task
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn render_skill(
     colors: &ThemeColors,
     name: &str,
@@ -873,7 +1103,7 @@ mod tools {
     /// Extract a string field value from JSON using simple pattern matching.
     /// Looks for patterns like `"key":"value"` or `"key": "value"`.
     /// This is a best-effort extraction for incomplete/streaming JSON.
-    fn extract_string_field(json: &str, key: &str) -> String {
+    pub(super) fn extract_string_field(json: &str, key: &str) -> String {
         // Pattern 1: "key":"value" (no space)
         let pattern1 = format!("\"{}\":\"", key);
         if let Some(start) = json.find(&pattern1) {
@@ -1384,6 +1614,87 @@ mod tests {
     /// A `read` of a `SKILL.md` renders as upstream's `[skill] <name>`
     /// invocation box: custom-message background, one collapsed line with an
     /// expand hint, and (when expanded) the frontmatter-stripped skill body.
+    /// Delegate panel: fixed identity header, live activity while running,
+    /// four-way terminal outcome — a partial never flips it to ✓, and a
+    /// timeout result renders ⏱, not a green check.
+    #[test]
+    fn delegate_panel_renders_live_then_four_way_outcomes() {
+        let comp = ToolExecutionComponent::new(
+            "delegate",
+            r#"{"agent":"luna","task":"检查子进程清理","model":"gpt-5.6-luna"}"#,
+        );
+        comp.set_delegate_info("luna", Some("gpt-5.6-luna"));
+        comp.set_running();
+
+        // A partial payload updates the activity line but must NOT complete.
+        comp.set_partial_result("执行 read");
+        let running = comp.render(80);
+        let plain = crate::ansi::strip_ansi(&running.join("\n"));
+        assert!(plain.contains("● luna · gpt-5.6-luna"), "identity header: {plain}");
+        assert!(plain.contains("检查子进程清理"), "task brief: {plain}");
+        assert!(plain.contains("执行 read"), "live activity: {plain}");
+        assert!(!plain.contains('✓'), "partial must not complete: {plain}");
+
+        // Completed → ✓ + hint.
+        comp.set_result("报告正文", false);
+        comp.set_delegate_outcome("completed");
+        let done = comp.render(80);
+        let plain = crate::ansi::strip_ansi(&done.join("\n"));
+        assert!(plain.contains("✓ luna"), "completed glyph: {plain}");
+        assert!(plain.contains("Ctrl+O"), "expand hint: {plain}");
+
+        // Timeout → ⏱ even though the tool returned Ok (set_result with
+        // is_error=false); the outcome label wins over the generic ✓.
+        let timeout = ToolExecutionComponent::new(
+            "delegate",
+            r#"{"agent":"luna","task":"t"}"#,
+        );
+        timeout.set_delegate_info("luna", None);
+        timeout.set_running();
+        timeout.set_result("Sub-agent timeout…", false);
+        timeout.set_delegate_outcome("timeout");
+        let plain = crate::ansi::strip_ansi(&timeout.render(80).join("\n"));
+        assert!(plain.contains('⏱'), "timeout glyph: {plain}");
+        assert!(!plain.contains('✓'), "timeout must not show ✓: {plain}");
+        assert!(plain.contains("子任务超时"), "timeout label: {plain}");
+
+        // Cancelled → ⊘; failed → ✗.
+        let cancelled = ToolExecutionComponent::new("delegate", r#"{"agent":"l"}"#);
+        cancelled.set_delegate_info("l", None);
+        cancelled.set_running();
+        cancelled.set_result("", false);
+        cancelled.set_delegate_outcome("cancelled");
+        let plain = crate::ansi::strip_ansi(&cancelled.render(80).join("\n"));
+        assert!(plain.contains('⊘') && !plain.contains('✓'), "cancelled: {plain}");
+
+        let failed = ToolExecutionComponent::new("delegate", r#"{"agent":"l"}"#);
+        failed.set_delegate_info("l", None);
+        failed.set_running();
+        failed.set_result("boom", true);
+        failed.set_delegate_outcome("failed");
+        let plain = crate::ansi::strip_ansi(&failed.render(80).join("\n"));
+        assert!(plain.contains('✗'), "failed glyph: {plain}");
+    }
+
+    /// The expanded delegate panel renders the sub-agent's report as
+    /// markdown (## / ** processed), not as raw text.
+    #[test]
+    fn delegate_panel_expanded_renders_markdown() {
+        let comp = ToolExecutionComponent::new(
+            "delegate",
+            r#"{"agent":"luna","task":"写报告","model":"m"}"#,
+        );
+        comp.set_delegate_info("luna", Some("m"));
+        comp.set_running();
+        comp.set_result("## 结论\n\n**所有检查通过**", false);
+        comp.set_delegate_outcome("completed");
+        comp.set_expanded(true);
+        let plain = crate::ansi::strip_ansi(&comp.render(80).join("\n"));
+        assert!(plain.contains("结论"), "markdown heading: {plain}");
+        // Bold markers are consumed by the markdown renderer, not shown raw.
+        assert!(!plain.contains("**"), "raw bold must be processed: {plain}");
+    }
+
     #[test]
     fn skill_invocation_renders_codex_compact_line() {
         let tool = ToolExecutionComponent::new("read", r#"{"path":"/skills/release/SKILL.md"}"#);
