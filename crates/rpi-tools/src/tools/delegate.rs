@@ -391,12 +391,49 @@ impl AgentTool for DelegateTool {
         });
 
         // Reader task: accumulate lines; the throttled flush runs inline on each
-        // line read (cheap: just a time check + tail clone).
+        // line read (cheap: just a time check + tail clone). A HEARTBEAT keeps
+        // the panel alive during event gaps: a long webfetch inside the
+        // sub-agent produces no stdout events for many seconds — without a
+        // periodic tick the panel's elapsed timer freezes and the run is
+        // indistinguishable from "nothing is executing".
         let update_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let reader = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = tokio::select! {
+                    l = lines.next_line() => match l {
+                        Ok(Some(l)) => Some(l),
+                        Ok(None) => break,          // stream ended
+                        Err(_) => break,             // pipe error: treat as end
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(
+                        DELEGATE_UPDATE_THROTTLE_MS,
+                    )) => None,                      // heartbeat tick
+                };
+                let Some(line) = line else {
+                    // Heartbeat: flush unconditionally so the panel re-renders
+                    // (elapsed advances) even when no event arrived.
+                    let mut guard = reader_state.lock().unwrap();
+                    guard.last_flush = Some(Instant::now());
+                    let activity = guard.activity.clone();
+                    drop(guard);
+                    if !activity.is_empty() {
+                        update_counter.fetch_add(1, Ordering::Relaxed);
+                        on_update(AgentToolResult {
+                            content: vec![TextContentOrImage::Text(TextContent {
+                                kind: Default::default(),
+                                text: activity,
+                                text_signature: None,
+                            })],
+                            details: serde_json::json!({"partial": true}),
+                            usage: None,
+                            added_tool_names: Vec::new(),
+                            terminate: false,
+                        });
+                    }
+                    continue;
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
