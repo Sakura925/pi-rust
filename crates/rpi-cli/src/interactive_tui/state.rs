@@ -263,6 +263,10 @@ pub(super) struct TuiState {
     pub(super) autocomplete_selection: std::sync::Mutex<usize>,
     /// Images queued from clipboard paste and attached to the next prompt.
     pub(super) pending_images: std::sync::Mutex<Vec<rpi_ai::types::ImageContent>>,
+    /// On-disk paths for the queued paste images (`~/.rpi/tmp/paste/…`). The
+    /// submit path injects them into the outgoing prompt so the model can
+    /// hand the files to vision-capable tools / extensions.
+    pub(super) pending_image_paths: std::sync::Mutex<Vec<String>>,
     /// Session working directory. Used by turn-boundary git-status refreshes
     /// (spawned from the event drain so the subprocess never blocks it).
     pub(super) cwd: Option<std::path::PathBuf>,
@@ -1382,11 +1386,23 @@ impl TuiState {
     }
 
     pub(super) fn queue_image(&self, image: rpi_ai::types::ImageContent) {
+        // Persist the pasted image to disk so tools that need a real file
+        // (vision skills, readers, extensions) can reach it — the message
+        // content alone only carries the base64 blob.
+        if let Some(path) = persist_pasted_image(&image) {
+            self.pending_image_paths.lock().unwrap().push(path);
+        }
         self.pending_images.lock().unwrap().push(image);
     }
 
     pub(super) fn take_pending_images(&self) -> Vec<rpi_ai::types::ImageContent> {
         std::mem::take(&mut *self.pending_images.lock().unwrap())
+    }
+
+    /// Take the on-disk paths of the queued paste images (paired with
+    /// [`take_pending_images`]).
+    pub(super) fn take_pending_image_paths(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_image_paths.lock().unwrap())
     }
 
     pub(super) fn restore_pending_images(&self, mut images: Vec<rpi_ai::types::ImageContent>) {
@@ -1409,5 +1425,78 @@ impl TuiState {
 
     pub(super) fn images_visible(&self) -> bool {
         *self.show_images.lock().unwrap()
+    }
+}
+
+/// Write a pasted image's decoded bytes to `<agent_dir>/tmp/paste/` and
+/// return the path. The filename is millisecond timestamp + a short content
+/// hash so repeated pastes never collide and the same image pasted twice
+/// stays inspectable. `None` on any I/O / decode failure — the in-memory
+/// attachment still ships with the prompt, only the on-disk copy is lost.
+pub(super) fn persist_pasted_image(image: &rpi_ai::types::ImageContent) -> Option<String> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.as_bytes())
+        .ok()?;
+    let ext = match image.mime_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "png",
+    };
+    let dir = crate::config::agent_dir().ok()?.join("tmp").join("paste");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    // Short content hash: stable across re-pastes, keeps names readable.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let stride = (bytes.len() / 512).max(1);
+    for byte in bytes.iter().step_by(stride) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let suffix = hash & 0xffff;
+    let path = dir.join(format!("paste-{ts}-{suffix:x}.{ext}"));
+    let mut file = std::fs::File::create(&path).ok()?;
+    file.write_all(&bytes).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod paste_image_tests {
+    use super::persist_pasted_image;
+    use base64::Engine;
+    use rpi_ai::types::ImageContent;
+
+    fn image(mime: &str, data: &str) -> ImageContent {
+        ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: data.to_string(),
+            mime_type: mime.to_string(),
+        }
+    }
+
+    #[test]
+    fn invalid_base64_yields_none() {
+        assert!(persist_pasted_image(&image("image/png", "not-valid-b64!!!")).is_none());
+    }
+
+    #[test]
+    fn valid_image_writes_file_and_returns_path() {
+        let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let path = persist_pasted_image(&image("image/png", &data))
+            .expect("valid png data must persist");
+        let stored = std::fs::read(&path).expect("file must be readable");
+        assert_eq!(stored, bytes);
+        // Extension follows the mime type; name carries the paste- prefix.
+        assert!(path.ends_with(".png"), "path: {path}");
+        assert!(path.contains("paste-"), "path: {path}");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1425,6 +1425,7 @@ pub async fn interactive_tui(
         autocomplete_max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
+        pending_image_paths: std::sync::Mutex::new(Vec::new()),
         cwd: Some(cwd.clone()),
         theme_manager,
         tui: Some(tui.clone()),
@@ -2965,9 +2966,20 @@ pub async fn interactive_tui(
                         &format!("Attached {} image(s) to this prompt.", prompt_images.len()),
                     );
                 }
+                // Paste-to-disk paths ride along with the outgoing prompt so
+                // the model can hand the files to tools that need a real path
+                // (vision skills, readers, extensions) — the in-chat user
+                // bubble above already shows the original text without this
+                // annotation.
+                let image_paths = state.take_pending_image_paths();
+                let outgoing_prompt = if image_paths.is_empty() {
+                    prompt.clone()
+                } else {
+                    format!("{prompt}\n\n[attached image(s) saved to: {}]", image_paths.join(", "))
+                };
                 run_prompt_streaming(
                     &lane,
-                    &prompt,
+                    &outgoing_prompt,
                     false,
                     &tui,
                     &state,
