@@ -1536,14 +1536,17 @@ impl Component for Editor {
             let plain = format!(" {} {} {} ", spinner_char, working.message, elapsed_str);
             let indicator_width = crate::ansi::visible_width(&plain);
 
-            if width >= indicator_width + 2 {
+            // 帧框占三列：`╭─` 两列 + `╮` 一列。指标占 indicator_width 列。
+            // 总宽必须精确等于 width，否则主屏的自动换行会破坏行数与光标
+            // 跟踪。
+            if width >= indicator_width + 3 {
                 let colored = format!(
                     " {} {} {} ",
                     colors.accent.fg(&spinner_char.to_string()),
                     colors.muted.fg(&working.message),
                     colors.muted.fg(&elapsed_str),
                 );
-                let right = border_color.fg(&"─".repeat(width - indicator_width - 2));
+                let right = border_color.fg(&"─".repeat(width - indicator_width - 3));
                 format!(
                     "{}{}{}{}",
                     border_color.fg("╭─"),
@@ -1652,6 +1655,46 @@ mod tests {
         editor.set_working(None);
         let idle = crate::strip_ansi(&editor.render(60)[0]);
         assert!(!idle.contains("Working"), "idle border: {idle}");
+    }
+
+    #[test]
+    fn working_border_width_is_exact() {
+        // P1-1 回归：working 边框总可见宽度必须精确等于 width。`╭─` 占两
+        // 列、`╮` 占一列，指标占 indicator_width 列，填充线补齐剩余 —— 任何
+        // 一列的偏差都会让主屏的自动换行破坏行数与光标跟踪。
+        use crate::component::Component;
+        let editor = Editor::simple();
+        editor.set_working(Some(WorkingState {
+            frame: 0,
+            started_at: std::time::Instant::now(),
+            message: "Working…".to_string(),
+        }));
+        for width in [20, 40, 60, 80, 120] {
+            let lines = editor.render(width);
+            let top = crate::strip_ansi(&lines[0]);
+            assert_eq!(
+                crate::ansi::visible_width(&top),
+                width,
+                "top border must be exactly {width} columns: {top:?}"
+            );
+            let bottom = crate::strip_ansi(lines.last().unwrap());
+            assert_eq!(
+                crate::ansi::visible_width(&bottom),
+                width,
+                "bottom border must be exactly {width} columns: {bottom:?}"
+            );
+        }
+
+        // 窄终端退化为纯圆角边框，同样精确。
+        for width in [2, 3, 10] {
+            let lines = editor.render(width);
+            let top = crate::strip_ansi(&lines[0]);
+            assert_eq!(
+                crate::ansi::visible_width(&top),
+                width,
+                "narrow top border must be exactly {width} columns: {top:?}"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,8 @@
 //!   最后一个 assistant message_end，含 TTFT、隐藏推理与 stall；turn 间的
 //!   工具执行不计入）
 //! - TTFT = turn 内首个流式 delta（text/thinking/toolcall）到达的耗时
-//! - stall：流式 delta 间隔 ≥ 1s 计一次（同一间隔只计一次）
+//! - stall：流式 delta 间隔 ≥ 1s 计一次，每个间隔独立计数（连续慢
+//!   delta 反映真实节奏，而非合并为一次长停顿）
 //! - input 口径与 /session 的 "uncached" 一致：input + cacheWrite（全新
 //!   近全价内容），cacheRead 为折价的重复内容，单列
 //! - $ / M = 该 turn 的 list-price 费率（usage.cost.total / totalTokens）
@@ -20,7 +21,9 @@ use std::time::Instant;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, AssistantMessageEvent};
 
-/// 流式 delta 间隔达到该值计一次 stall（telemetry.ts 的 1000ms）。
+/// 流式 delta 间隔达到该值计一次 stall（telemetry.ts 的 1000ms）。每个
+/// 间隔独立计数：连续慢 delta（每个间隔都超阈值）算多次 stall，而不是
+/// 合并成一次长停顿。
 const STALL_THRESHOLD_MS: u64 = 1000;
 
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
@@ -57,9 +60,9 @@ struct TurnState {
     generation: Option<Instant>,
     stall_ms: u64,
     stall_count: u32,
-    /// 当前流式消息的上一个 delta 时刻（message 边界重置）。
+    /// 当前流式消息的上一个 delta 时刻（message 边界重置：turn 内的
+    /// 工具执行期不算 stall）。
     last_delta: Option<Instant>,
-    in_stall: bool,
     /// 本 turn 所有 assistant 消息的 usage 累积。
     input: i64,
     output: i64,
@@ -105,7 +108,6 @@ impl TurnTelemetryTracker {
                     stall_ms: 0,
                     stall_count: 0,
                     last_delta: None,
-                    in_stall: false,
                     input: 0,
                     output: 0,
                     cache_read: 0,
@@ -121,7 +123,6 @@ impl TurnTelemetryTracker {
                     if let Some(state) = turn.as_mut() {
                         // message 边界重置流式状态（工具执行期不计 stall）。
                         state.last_delta = None;
-                        state.in_stall = false;
                     }
                 }
                 None
@@ -141,14 +142,11 @@ impl TurnTelemetryTracker {
                 }
                 let last = state.last_delta.unwrap_or(now);
                 let gap_ms = now.duration_since(last).as_millis() as u64;
+                // 每个超阈值间隔独立计数：输出在 0/2/4/6s 到达 → 3x/6.0s，
+                // 反映“模型在慢慢吐 token”的真实节奏，而非一次长停顿。
                 if gap_ms >= STALL_THRESHOLD_MS {
-                    if !state.in_stall {
-                        state.stall_count += 1;
-                    }
-                    state.in_stall = true;
+                    state.stall_count += 1;
                     state.stall_ms += gap_ms;
-                } else {
-                    state.in_stall = false;
                 }
                 state.last_delta = Some(now);
                 None
@@ -420,6 +418,34 @@ mod tests {
         assert_eq!(telemetry.stall_ms, 4_300);
         let line = format_turn_telemetry(&telemetry);
         assert!(line.contains("! stall 1x/4.3s"), "{line}");
+    }
+
+    #[test]
+    fn consecutive_slow_deltas_count_each_gap() {
+        let clock = FakeClock::new();
+        let tracker = clock.tracker();
+
+        tracker.record(&AgentEvent::TurnStart);
+        tracker.record(&text_delta()); // 首 token，t=0
+
+        // delta 在 0/2/4/6s 到达：每个 2s 间隔都超阈值，各自计一次
+        // stall（3x / 6.0s），而不是合并成 1x/6.0s。
+        for _ in 0..3 {
+            clock.advance(2_000);
+            tracker.record(&text_delta());
+        }
+
+        tracker.record(&assistant_done_event(Usage {
+            output: 10,
+            ..Usage::zero()
+        }));
+
+        let telemetry = tracker.record(&turn_end()).expect("telemetry");
+
+        assert_eq!(telemetry.stall_count, 3);
+        assert_eq!(telemetry.stall_ms, 6_000);
+        let line = format_turn_telemetry(&telemetry);
+        assert!(line.contains("! stall 3x/6.0s"), "{line}");
     }
 
     #[test]

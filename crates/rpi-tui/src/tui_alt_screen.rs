@@ -617,17 +617,61 @@ impl TuiAltScreen {
         self.set_render_suspended(false);
     }
 
-    /// True when both rows render as pure whitespace (ignoring ANSI styling
-    /// and OSC 8 hyperlink escapes): repainting between them has no visible
-    /// effect beyond style tails.
+    /// True when both rows render as pure whitespace AND carry only "neutral"
+    /// escapes — SGR reset / default fg / default bg / normal intensity, and
+    /// the OSC 8 hyperlink close. Those have no visible effect on a blank row.
+    /// Rows with painted attributes (backgrounds, colors, non-SGR CSI moves)
+    /// are NOT equivalent: the scrollbar and tool-panel blank rows rely on
+    /// their painted background, and a lost repaint would leave a stale bg.
     fn blank_row_pair(old: Option<&String>, new: Option<&String>) -> bool {
         match (old, new) {
-            (Some(old), Some(new)) => {
-                crate::ansi::strip_ansi(old).trim().is_empty()
-                    && crate::ansi::strip_ansi(new).trim().is_empty()
-            }
+            (Some(old), Some(new)) => Self::neutral_blank_row(old) && Self::neutral_blank_row(new),
             _ => false,
         }
+    }
+
+    /// Manual scan of one row: every byte must be a space, an `\x1b[0m`-family
+    /// SGR (params all in {empty, 0, 22, 39, 49}), or the OSC 8 close
+    /// `\x1b]8;;\x07`. Anything else — painted SGR, other CSI, tabs, text —
+    /// disqualifies the row.
+    fn neutral_blank_row(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b' ' => i += 1,
+                0x1b => {
+                    let rest = &line[i..];
+                    if rest.starts_with("\x1b]8;;\x07") {
+                        i += "\x1b]8;;\x07".len();
+                        continue;
+                    }
+                    if !rest.starts_with("\x1b[") {
+                        return false;
+                    }
+                    // Only m-terminated SGR can be neutral; other CSI (moves,
+                    // erases) is positional and must be repainted.
+                    let Some(end) = rest[2..]
+                        .bytes()
+                        .position(|b| (0x40..=0x7e).contains(&b))
+                    else {
+                        return false;
+                    };
+                    if &rest[2 + end..3 + end] != "m" {
+                        return false;
+                    }
+                    let params = &rest[2..2 + end];
+                    if !params.split(';').all(|p| {
+                        matches!(p, "" | "0" | "m" | "22" | "39" | "49")
+                    }) {
+                        return false;
+                    }
+                    i += 3 + end;
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Render the complete component tree into the main terminal buffer. This
@@ -770,14 +814,20 @@ impl TuiAltScreen {
                         hardware_row = move_target;
                     }
                 }
-                let current_screen = hardware_row.saturating_sub(viewport_top);
-                let target_screen = move_target.saturating_sub(viewport_top);
-                if target_screen > current_screen {
-                    output.push_str(&format!("\x1b[{}B", target_screen - current_screen));
-                } else if current_screen > target_screen {
-                    output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
+                // 自愈重发后光标已在文档末行行尾（hardware_row 与 viewport_top
+                // 已重置同步）；跳过面向 diff 写入的增量定位，否则光标会被
+                // 移到 move_target 而内容不再写入，实际位置与内部记录再次
+                // 失配。
+                if !healed {
+                    let current_screen = hardware_row.saturating_sub(viewport_top);
+                    let target_screen = move_target.saturating_sub(viewport_top);
+                    if target_screen > current_screen {
+                        output.push_str(&format!("\x1b[{}B", target_screen - current_screen));
+                    } else if current_screen > target_screen {
+                        output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
+                    }
+                    output.push_str(if append_start { "\r\n" } else { "\r" });
                 }
-                output.push_str(if append_start { "\r\n" } else { "\r" });
                 let mut render_end = last.min(lines.len().saturating_sub(1));
                 if force_tail_repaint {
                     render_end = lines.len().saturating_sub(1);
@@ -1809,9 +1859,11 @@ mod tests {
         let terminal = RecordingTerminal {
             output: output.clone(),
         };
+        // apply_line_resets 的中性尾巴（SGR 0 + OSC8 close）：重置类序列在
+        // 空白行上无可见效果，剪枝安全。
         let lines = Arc::new(Mutex::new(vec![
             "hello".to_string(),
-            format!("{}\x1b[31m", " ".repeat(40)),
+            format!("{}\x1b[0m\x1b]8;;\x07", " ".repeat(40)),
         ]));
         let content = Arc::new(StaticLines(lines.clone()));
         let tui = TuiAltScreen::new(Box::new(terminal), true, None);
@@ -1821,17 +1873,105 @@ mod tests {
         tui.do_render(false);
         output.lock().unwrap().clear();
 
-        // 第二行仍是 40 列空白，只有样式尾巴变化（典型 markdown 空行重置）。
+        // 第二行仍是 40 列空白，只是尾巴从“reset+OSC8”变成纯空：两边都是
+        // 中性空白 → 剪枝，不产生“跳列 + 无文本”帧字节。
         *lines.lock().unwrap() = vec![
             "hello".to_string(),
-            format!("{}\x1b[32m", " ".repeat(40)),
+            " ".repeat(40),
         ];
         tui.do_render(false);
 
         let frame = output.lock().unwrap().clone();
-        // 空白行样式 diff 被剪枝：不产生“跳列 + 无文本”帧字节。
-        assert!(!frame.contains("\x1b[40C"));
-        assert!(!frame.contains("\x1b[32m"));
+        // 空白行中性样式 diff 被剪枝：不产生“跳列 + 无文本”帧字节。
+        assert!(!frame.contains("\x1b[40C"), "{frame:?}");
+        tui.stop(Default::default());
+    }
+
+    #[test]
+    fn regular_mode_repaints_painted_blank_rows() {
+        // 带背景色的空白行是“实际绘制属性”（P2-3）：颜色变化必须重绘，
+        // 否则工具面板/滚动条的空白背景行会残留旧色。
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let lines = Arc::new(Mutex::new(vec![
+            "hello".to_string(),
+            format!("\x1b[41m{}\x1b[0m", " ".repeat(40)), // 红底空白行
+        ]));
+        let content = Arc::new(StaticLines(lines.clone()));
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content));
+        tui.start_readerless();
+        tui.do_render(false);
+        output.lock().unwrap().clear();
+
+        // 红底 → 绿底：可见背景变化，不能被空白行剪枝吞掉。
+        *lines.lock().unwrap() = vec![
+            "hello".to_string(),
+            format!("\x1b[42m{}\x1b[0m", " ".repeat(40)), // 绿底空白行
+        ];
+        tui.do_render(false);
+
+        let frame = output.lock().unwrap().clone();
+        assert!(frame.contains("\x1b[42m"), "{frame:?}");
+        tui.stop(Default::default());
+    }
+
+    #[test]
+    fn regular_mode_healed_frame_leaves_cursor_at_document_tail() {
+        // P1-2 回归：自愈重发后光标停在文档末行，下一帧必须是纯 append
+        // （无 A/B 光标移动），否则实际光标与 hardware_row 记录失配。
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new(
+            &(0..60)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        tui.do_render(false);
+
+        // 漂移 + 61 行 → 自愈全量重发。
+        *tui.main_viewport_top.lock().unwrap() = 0;
+        *tui.main_hardware_row.lock().unwrap() = 0;
+        content.set_text(
+            &(0..60)
+                .map(|i| format!("line {i}"))
+                .chain(std::iter::once("new tail".to_string()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        tui.do_render(false);
+        output.lock().unwrap().clear();
+
+        // 自愈后再追加一行：应输出纯 append，不带任何光标重定位。
+        content.set_text(
+            &(0..60)
+                .map(|i| format!("line {i}"))
+                .chain([
+                    "new tail".to_string(),
+                    "another line".to_string(),
+                ])
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        tui.do_render(false);
+
+        let frame = output.lock().unwrap().clone();
+        assert!(frame.contains("another line"), "{frame:?}");
+        assert!(!frame.contains("\x1b[1A"), "cursor must not reposition: {frame:?}");
+        assert!(!frame.contains("\x1b[1B"), "cursor must not reposition: {frame:?}");
+        assert!(!frame.contains("\x1b[2J"), "{frame:?}");
         tui.stop(Default::default());
     }
 

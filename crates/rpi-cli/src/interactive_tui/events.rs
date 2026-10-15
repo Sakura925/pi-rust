@@ -186,17 +186,18 @@ pub(super) async fn handle_agent_event(
         }
 
         AgentEvent::AgentEnd { .. } => {
-            // Finalize any still-streaming assistant message.
-            state.transcript_view().finalize_assistant();
-            state.set_status(RunStatus::Idle);
             // Thinking peek：任务收尾，恢复原生 "Thinking..." 标签
-            // （pi-open-tui 的 restore 行为）。
+            // （pi-open-tui 的 restore 行为）。必须在 finalize 之前 ——
+            // finalize_assistant 会 take 掉 current_assistant。
             state.thinking_peek.reset();
             if state.hide_thinking() {
                 if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
                     comp.set_hidden_thinking_label(super::thinking_peek::NATIVE_LABEL);
                 }
             }
+            // Finalize any still-streaming assistant message.
+            state.transcript_view().finalize_assistant();
+            state.set_status(RunStatus::Idle);
             // Flush any `!command` results that completed mid-run: the run's
             // tool sequence is closed, so appending now keeps transcript order
             // intact (upstream's `flushPendingBashMessages`).
@@ -249,6 +250,10 @@ pub(super) async fn handle_agent_event(
 
         AgentEvent::MessageStart { message } => match message {
             AgentMessage::Assistant(a) => {
+                // Thinking peek：新 assistant 消息开始时重置状态机，工具链后
+                // 的第二条回复才能重新旋转 spinner（否则 phase 停在 Done，
+                // update 永远返回 None）。
+                state.thinking_peek.reset();
                 // The shared transcript view renders this through the same
                 // component path as the remote client. It installs the live
                 // markdown transformer + hide-thinking preference itself.
@@ -353,10 +358,9 @@ pub(super) async fn handle_agent_event(
         AgentEvent::MessageEnd { message } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
-                state
-                    .transcript_view()
-                    .finalize_assistant_blocks(&assistant_blocks(a));
-                // Thinking peek：消息收尾，thinking 阶段落定为 ✓。
+                // Thinking peek：消息收尾，thinking 阶段落定为 ✓。必须在
+                // finalize 之前写入 —— finalize_assistant_blocks 会 take 掉
+                // current_assistant，之后再拿不到组件。
                 if state.hide_thinking() {
                     if let Some(label) = state.thinking_peek.settle(tui.width()) {
                         if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
@@ -364,6 +368,9 @@ pub(super) async fn handle_agent_event(
                         }
                     }
                 }
+                state
+                    .transcript_view()
+                    .finalize_assistant_blocks(&assistant_blocks(a));
                 // Cache the finalized text for `/copy`.
                 if !text.is_empty() {
                     *state.last_assistant_text.lock().unwrap() = text;
