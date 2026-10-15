@@ -586,12 +586,12 @@ impl TranscriptView {
         };
         comp.set_result(&text, is_error);
         if !ask_user {
-            if let ("delegate", Some(outcome)) = (
-                name,
-                details
-                    .and_then(|d| d.get("outcome"))
-                    .and_then(Value::as_str),
-            ) {
+            let delegator_outcome = details
+                .and_then(|d| d.get("outcome"))
+                .and_then(Value::as_str);
+            if let Some(outcome) = delegator_outcome.filter(|_| {
+                matches!(name, "delegate" | "delegate_task")
+            }) {
                 // Four-way terminal state: completed / failed / timeout /
                 // cancelled — the panel reads this instead of assuming ✓.
                 comp.set_delegate_outcome(outcome);
@@ -803,12 +803,20 @@ fn apply_delegate_info(
     tool_name: &str,
     args: &Value,
 ) {
-    if tool_name != "delegate" {
+    // Match both delegators: the built-in `delegate` (rpi-tools, args carry
+    // agent/model) AND the global extension's `delegate_task`
+    // (librpi_subagents envelope style, args carry task/role/maxTurns).
+    // Both render through the delegate panel — the extension's multi-kB task
+    // JSON otherwise floods the generic panel and destabilizes the layout.
+    if !matches!(tool_name, "delegate" | "delegate_task") {
         return;
     }
+    // Identity: built-in uses `agent` (+ optional model); the envelope
+    // extension uses `role` (a short job title).
     let agent = args
         .get("agent")
         .and_then(Value::as_str)
+        .or_else(|| args.get("role").and_then(Value::as_str))
         .unwrap_or("sub-agent");
     let model = args.get("model").and_then(Value::as_str);
     comp.set_delegate_info(agent, model);
