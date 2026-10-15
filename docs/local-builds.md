@@ -79,3 +79,45 @@
 - `RPI_MAX_TURNS_PER_RUN=80 rpi`(高于取证 40 轮正当探索,低于 112 轮跑飞案例)
 - `RPI_WORKING_STATE_INTERVAL=10 rpi` / `RPI_REPEAT_TOOL_REMINDER=1 rpi`
 - 验收指标:BudgetStop 触发次数、单 run 轮数分布(从会话 JSONL 统计);token 配置(32768/4096)按真实输出量与截断率再调
+
+## 测试构建:2026-10-15 15:5x · TUI 白屏修复 + pi-open-tui 功能迁移(未晋级)
+
+> **状态:测试期构建,未合入 local_master。** 日用 `~/.cargo/bin/rpi` 暂时来自 feat 分支;试用验收通过后按晋级流程 ff 合 local_master 再正式归档(届时更新本节状态)。
+
+| 项 | 值 |
+|---|---|
+| 来源分支 | `feat/tui-main-screen-fix` @ `8e193de`(5 commits:1 白屏修复 + 3 功能迁移 + 1 审查修复) |
+| 版本 | rpi 0.3.23(个人功能叠加,无上游变更) |
+| 产物 SHA-256 | `615dcd36ca3968e8f82862b201fddd7656e29e92458e1cfff99bbb5807166906` |
+| 构建参数 | `cargo build --release --locked` |
+| 安装一致性 | `~/.cargo/bin/rpi` 与 `target/release/rpi` SHA-256 相同;macOS 先 rm 再 cp |
+
+### 个人内容
+
+1. **主屏白屏修复**(`tui_alt_screen.rs`):视口跟踪漂移导致的失控滚动(`\r\n`×N 把正文推出视口)改为 scroll>屏高 时全量重发自愈并重同步 viewport 状态;空白行的 reset 尾巴 diff 剪枝(消除 replay 字节流 38% 的"跳列+无文本"噪声)
+2. **圆角 editor 边框**(`editor.rs`):`╭─…─╮`/`╰─…─╯`,working spinner 嵌入保留
+3. **thinking peek**(`thinking_peek.rs`):hide-thinking 时推理尾部 ticker(`~ think ⠋ …`),正文开始落定 ✓,任务收尾恢复原生标签
+4. **turn 遥测**(`turn_telemetry.rs`):每 turn 结束一行 `TPS/TTFT/+/↑/↓/stall/$ per M`
+
+### 验证记录(全部通过)
+
+| 关卡 | 结果 |
+|---|---|
+| 外部审查 | 探针审查一轮:2×P1(working 边框超宽 1 列、自愈后光标失配)+4×P2(空白行剪枝吞背景变化、peek 拿不到组件、工具链第二条消息不转、stall 合并计数),全部修复(`8e193de`) |
+| 探针固化 | `working_border_width_is_exact`、`regular_mode_healed_frame_leaves_cursor_at_document_tail`、`regular_mode_repaints_painted_blank_rows`、`consecutive_slow_deltas_count_each_gap` 等 5 个新回归 |
+| `cargo test --workspace --locked` | ALL PASS(rpi-tui 323 / rpi-cli 498) |
+| 死锁回归 | `dialog_key_routing_*` 1 passed(未挂死) |
+| 冒烟 | `rpi -p "只回复一个字:好"` → `好`(模型连通;TUI 观感待日常试用) |
+
+### 试用验收点(待确认)
+
+- [ ] 长任务(流式大段输出/工具循环)不再白屏,内容持续可见,scrollback 完整
+- [ ] hide-thinking 开启时 thinking peek:spinner+推理尾行 → ✓ → 任务结束恢复 `Thinking...`;工具链第二条消息重新旋转
+- [ ] 每 turn 结束的遥测行数值合理(TPS/TTFT/stall)
+- [ ] 圆角输入框 + working 状态边框不换行不错位(40 列窄终端也正常)
+- [ ] 旧 session 副本 `--export` 兼容(本改动无新 entry 类型,预期无风险)
+
+### 回退保险
+
+- 旧二进制备份:`~/.cargo/bin/rpi-bak-20261015-pre-tui-main-screen-fix`(8056320 构建,晋级 #2 产物)
+- 版本红线不变:本改动未引入新 session 格式,回退无格式风险;验收通过后走正式晋级流程
