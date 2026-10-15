@@ -229,11 +229,20 @@ impl AgentTool for DelegateTool {
             .current_dir(&cwd)
             // Turn budget rides the same env var the harness reads
             // (`RPI_MAX_TURNS_PER_RUN`); there is no CLI flag for it.
-            .env("RPI_MAX_TURNS_PER_RUN", max_turns.to_string())
-            // The parent's nesting/tracing env (RPI_SESSION_ID et al.) is
-            // inherited verbatim — this is the supported subagent path,
-            // unlike the bash tool's host-private stripping.
-            ;
+            .env("RPI_MAX_TURNS_PER_RUN", max_turns.to_string());
+        // P1 review fix: own the child's lifetime — if this future is dropped
+        // before completion (loop cancellation), the child is killed instead of
+        // being orphaned.
+        command.kill_on_drop(true);
+        // P1 review fix: new process group so a timeout/cancel terminates the
+        // WHOLE tree (nested rpi spawns shells/builds of its own).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // New process group = pgid equals the child pid; termination
+            // targets the group (see kill_process).
+            let _ = command.as_std_mut().process_group(0);
+        }
         if let Some(model) = model.as_deref() {
             command.arg("--model").arg(model);
         }
@@ -252,8 +261,31 @@ impl AgentTool for DelegateTool {
             .stdout
             .take()
             .expect("delegate_task: stdout piped above");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("delegate_task: stderr piped above");
         let state = Arc::new(Mutex::new(StreamState::default()));
         let reader_state = Arc::clone(&state);
+
+        // P1 review fix: stderr must be drained concurrently or a chatty child
+        // (plugin logs, diagnostics) fills the 64 KiB pipe buffer and blocks
+        // forever, riding the whole timeout window. Keep a bounded tail and
+        // surface it on failure.
+        let stderr_state = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stderr_tail_reader = Arc::clone(&stderr_state);
+        let stderr_reader = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut tail = stderr_tail_reader.lock().unwrap();
+                tail.push(line);
+                let overflow = tail.len().saturating_sub(PARTIAL_TAIL_LINES);
+                if overflow > 0 {
+                    tail.drain(..overflow);
+                }
+            }
+        });
 
         // Reader task: accumulate lines; the throttled flush runs inline on each
         // line read (cheap: just a time check + tail clone).
@@ -313,11 +345,16 @@ impl AgentTool for DelegateTool {
             }
         };
 
-        // Give the reader a moment to drain the pipe after process exit.
+        // Give the readers a moment to drain the pipes after process exit.
         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), stderr_reader).await;
         let final_output = {
             let guard = state.lock().unwrap();
             guard.lines.join("\n")
+        };
+        let stderr_tail = {
+            let tail = stderr_state.lock().unwrap();
+            tail.join("\n")
         };
         let elapsed = started.elapsed();
 
@@ -348,6 +385,12 @@ impl AgentTool for DelegateTool {
             ));
         }
         content.push_str(&final_output);
+        // P1 review fix: surface the child's stderr tail so failures diagnose
+        // themselves (the pipe was previously never read at all).
+        if !stderr_tail.trim().is_empty() {
+            content.push_str("\n\n[stderr tail]\n");
+            content.push_str(&stderr_tail);
+        }
 
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::Text(TextContent {
@@ -371,15 +414,18 @@ impl AgentTool for DelegateTool {
     }
 }
 
-/// Kill by pid via a shell command — kept tiny and platform-split. This is
-/// the fallback for the select-loop race (tokio's `Child::kill` is not
-/// available after a pending `wait` future exists on some paths).
+/// Kill the child's whole process group — the spawn side puts the nested rpi
+/// in its own group (pgid == pid), and its shells/builds live in that group,
+/// so a group kill terminates the entire tree instead of leaving orphaned
+/// descendants running (P1 review finding: cancel/timeout previously killed
+/// only the direct pid).
 fn kill_process(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::process::Command::new("kill")
             .arg("-9")
-            .arg(pid.to_string())
+            .arg("--")
+            .arg(format!("-{pid}"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -388,7 +434,7 @@ fn kill_process(pid: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
+            .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
