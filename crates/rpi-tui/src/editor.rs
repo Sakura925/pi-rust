@@ -1521,6 +1521,7 @@ impl Component for Editor {
             // Working indicator embedded in the top border: spinner + message +
             // elapsed time, with the remaining width filled by border glyphs.
             // The frame set is shared with `Loader` so the two never drift.
+            // The border uses rounded corners (pi-open-tui's editor style).
             let frames = crate::loader::SPINNER_FRAMES;
             let spinner_char = frames[working.frame % frames.len()];
             let colors = crate::theme::theme().colors;
@@ -1535,26 +1536,29 @@ impl Component for Editor {
             let plain = format!(" {} {} {} ", spinner_char, working.message, elapsed_str);
             let indicator_width = crate::ansi::visible_width(&plain);
 
-            if width >= indicator_width + 1 {
+            if width >= indicator_width + 2 {
                 let colored = format!(
                     " {} {} {} ",
                     colors.accent.fg(&spinner_char.to_string()),
                     colors.muted.fg(&working.message),
                     colors.muted.fg(&elapsed_str),
                 );
-                let right = border_color.fg(&"─".repeat(width - indicator_width - 1));
-                format!("{}{}{}", border_color.fg("─"), colored, right)
+                let right = border_color.fg(&"─".repeat(width - indicator_width - 2));
+                format!(
+                    "{}{}{}{}",
+                    border_color.fg("╭─"),
+                    colored,
+                    right,
+                    border_color.fg("╮")
+                )
             } else {
-                border_color.fg(&"─".repeat(width))
+                rounded_border_row(width, "╭", "╮", border_color)
             }
         } else {
-            border_color.fg(&"─".repeat(width))
+            rounded_border_row(width, "╭", "╮", border_color)
         };
 
-        let bottom_border = {
-            let horizontal = "─".repeat(width);
-            border_color.fg(&horizontal)
-        };
+        let bottom_border = rounded_border_row(width, "╰", "╯", border_color);
 
         let mut lines = Vec::with_capacity(content_lines.len() + 2);
         lines.push(top_border);
@@ -1576,6 +1580,25 @@ impl Component for Editor {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Build a full-width bordered row with rounded corners (pi-open-tui's editor
+/// frame style): `left` + `─` fill + `right`, painted with `color`. Widths of
+/// 0 and 1 degenerate to an empty row / a single dash so narrow terminals
+/// never wrap.
+fn rounded_border_row(
+    width: usize,
+    left: &str,
+    right: &str,
+    color: crate::theme::Color,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return color.fg("─");
+    }
+    color.fg(&format!("{left}{}{right}", "─".repeat(width - 2)))
 }
 
 impl Focusable for Editor {
@@ -1710,14 +1733,16 @@ mod tests {
         editor.set_focused(true);
         editor.insert("echo hi");
 
-        let default_border = crate::theme::theme().colors.border.fg(&"─".repeat(20));
+        let default_border =
+            crate::theme::theme().colors.border.fg(&format!("╭{}╮", "─".repeat(18)));
         assert!(editor.render(20).contains(&default_border));
         assert_eq!(editor.border_color(), None);
 
         // Bash mode sets an explicit accent; the border line changes and the
         // theme default is gone.
         editor.set_border_color(Some(crate::theme::theme().colors.bash_mode));
-        let bash_border = crate::theme::theme().colors.bash_mode.fg(&"─".repeat(20));
+        let bash_border =
+            crate::theme::theme().colors.bash_mode.fg(&format!("╭{}╮", "─".repeat(18)));
         assert_eq!(
             editor.border_color(),
             Some(crate::theme::theme().colors.bash_mode)
@@ -2096,9 +2121,9 @@ l12",
 
     #[test]
     fn test_editor_render_has_borders() {
-        // The editor renders a native-pi bordered box: a full-width `─` line
-        // above and below the content, with no `> ` prompt prefix on the text
-        // lines (mirrors TS editor.ts:525-588).
+        // The editor renders a rounded bordered box (pi-open-tui style): a
+        // `╭─…─╮` line above and a `╰─…─╯` line below the content, with no `> `
+        // prompt prefix on the text lines.
         let editor = Editor::new(
             EditorOptions {
                 padding_x: 1,
@@ -2110,17 +2135,17 @@ l12",
         editor.set_text("hi");
         let lines = editor.render(20);
         assert_eq!(lines.len(), 3, "expected [border, content, border]");
-        // Both borders are a 20-wide `─` run (visible width, ANSI stripped).
+        // Both borders are 20 columns wide: 18 dashes plus two corner glyphs.
         let top = crate::ansi::strip_ansi(&lines[0]);
         let bottom = crate::ansi::strip_ansi(lines.last().unwrap());
         assert_eq!(
             top.chars().filter(|c| *c == '─').count(),
-            20,
+            18,
             "top border not full width: {top:?}"
         );
         assert_eq!(
             bottom.chars().filter(|c| *c == '─').count(),
-            20,
+            18,
             "bottom border not full width: {bottom:?}"
         );
         // The content line carries the text with no `> ` prompt.
