@@ -182,3 +182,56 @@
 - 实战验证：delegate_task 派 tty7-cli-skill-writer 完整跑 2m11s（调研 2 页面 → 蒸馏 12KB SKILL.md 落盘 ~/.rpi/agent/skills/tty7-cli/ → 结构化回报），面板 `✓ agent · 2m11s` + 简述 + Ctrl+O 展开全程正确
 - 产物 SHA-256：`35113c71…`（06f8b99 时代）→ 后续三个增量提交后已重装，见 `shasum ~/.cargo/bin/rpi`
 - 推送：local_master / feat 双分支均至 `6d3da74` ✓
+
+---
+
+## 晋级 #4：上游 v0.5.0 全量同步（2026-10-18）
+
+### 背景
+
+上游连发 3 版（v0.4.0 / v0.4.1 / v0.5.0，44 commits），用户发起同步。核心上游变更：
+plugin-owned child agent lifecycle、**runaway-scroll 重复内容修复**（与 2026-10-18 本地取证的「长回复重复两遍」bug 同源）、
+thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 重构。
+
+### 合并裁决（6 文件 9 处冲突，全部语义审查）
+
+| 冲突文件 | 裁决 |
+|---|---|
+| openai_completions.rs | fork 的 mapped_reasoning_effort 退役（上游原生实现 thinking_level_map）；null 回落语义随上游 |
+| config.rs / settings.rs | 上游强类型字段与 fork 弱类型重名（自动合并产生重复字段定义，编译错级），保留上游强类型 + fork 特有 thinking_budgets；清除 3 处重复初始化 |
+| interactive_tui.rs | dialog key 路由跟上游改名 handle_extension_dialog_key（含等价死锁修复）；死锁回归测试改名保留 |
+| agent_harness.rs | run_budget 采上游配置化（max_turns → RunBudget::new）；fork 的 reminder_registry + budget 交接摘要保留 |
+| bash_execution.rs | 采上游 render_panel 架构；codex 视觉经 status_line glyph 状态行部分保留 |
+| tui_alt_screen.rs | **采上游 e59a6bb 方案**：删除 fork 继承的 force_tail_repaint/healed SD 自愈（上游认定为 scrollback 重复的根因），改 changed_in_scrollback 检测 + 清屏全量重建；自愈测试改造为新契约回归 |
+
+### 关卡
+
+| 关卡 | 结果 |
+|---|---|
+| `cargo test --workspace --locked` | ALL PASS（1931 tests / 0 failed，含 fmt 后复跑） |
+| 死锁回归 | `dialog_key_routing_*` 1 passed（无挂死） |
+| 旧 session 兼容 | runloom 23678 行会话 + 本地 0.3.x 会话 `--export` 均成功（安装前后各验一次） |
+| 安装入口检查 | local_master ✓ 工作树干净 ✓ HEAD=b32f47f ✓ |
+
+### 产物与安装
+
+- commit：local_master = `b32f47f`（merge `fbe6114` + fmt `b32f47f`）
+- 构建：`cargo build --release --locked -p rpi-cli`（2m49s，thin LTO + codegen-units=16）
+- 产物 SHA-256：`2d31f51bd350d689e13d9650d2680a02c155eb91ccc684a614c4ddca22d576cc`（安装前后核对一致）
+- 安装：备份 → `rm` + `cp`（macOS 签名缓存纪律）→ `rpi 0.5.0` ✓
+
+### 回退保险
+
+- 旧二进制备份：`~/.cargo/bin/rpi-0.3.24-bak`
+- **版本红线（本次升级跨 2 个 minor）**：0.5.0 含 child agent 等新机制，升级后**禁止回退 0.3.24 日常使用**（0.5.0 写过的 session 旧二进制 fail-closed）
+
+### 推送记录
+
+- `origin/local_master` 推送超时（GitHub 网络不通，ls-remote 也超时）——**遗留：网络恢复后补推**（`git push origin local_master`）
+- main 已快进至 v0.5.0（621b9d9），未推送（纪律：main 永不推）
+
+### 遗留事项
+
+- **feat/render-viewport-drift**：其中 healed 清屏修复已被上游 e59a6bb 方案取代（合并点消失）；仅 resume() SIGTSTP 重锚定仍有价值——需从新 local_master 重开分支重放
+- **feat/delegate-visibility**：待 merge 新 main 后继续
+- 正在运行的老进程（旧 0.3.24，含 tty7 各会话）继续用旧 inode 写旧格式（可读）；新开会话即 0.5.0
