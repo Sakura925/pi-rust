@@ -341,12 +341,10 @@ pub(super) async fn handle_agent_event(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let has_text = a.content.iter().any(|c| {
-                    matches!(c, rpi_ai::types::Content::Text(t) if !t.text.trim().is_empty())
-                });
-                if let Some(label) =
-                    state.thinking_peek.update(&thinking, has_text, tui.width())
-                {
+                let has_text = a.content.iter().any(
+                    |c| matches!(c, rpi_ai::types::Content::Text(t) if !t.text.trim().is_empty()),
+                );
+                if let Some(label) = state.thinking_peek.update(&thinking, has_text, tui.width()) {
                     if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
                         comp.set_hidden_thinking_label(&label);
                     }

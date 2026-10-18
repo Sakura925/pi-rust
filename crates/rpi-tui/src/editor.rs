@@ -1589,12 +1589,7 @@ impl Component for Editor {
 /// frame style): `left` + `─` fill + `right`, painted with `color`. Widths of
 /// 0 and 1 degenerate to an empty row / a single dash so narrow terminals
 /// never wrap.
-fn rounded_border_row(
-    width: usize,
-    left: &str,
-    right: &str,
-    color: crate::theme::Color,
-) -> String {
+fn rounded_border_row(width: usize, left: &str, right: &str, color: crate::theme::Color) -> String {
     if width == 0 {
         return String::new();
     }
@@ -1776,16 +1771,20 @@ mod tests {
         editor.set_focused(true);
         editor.insert("echo hi");
 
-        let default_border =
-            crate::theme::theme().colors.border.fg(&format!("╭{}╮", "─".repeat(18)));
+        let default_border = crate::theme::theme()
+            .colors
+            .border
+            .fg(&format!("╭{}╮", "─".repeat(18)));
         assert!(editor.render(20).contains(&default_border));
         assert_eq!(editor.border_color(), None);
 
         // Bash mode sets an explicit accent; the border line changes and the
         // theme default is gone.
         editor.set_border_color(Some(crate::theme::theme().colors.bash_mode));
-        let bash_border =
-            crate::theme::theme().colors.bash_mode.fg(&format!("╭{}╮", "─".repeat(18)));
+        let bash_border = crate::theme::theme()
+            .colors
+            .bash_mode
+            .fg(&format!("╭{}╮", "─".repeat(18)));
         assert_eq!(
             editor.border_color(),
             Some(crate::theme::theme().colors.bash_mode)

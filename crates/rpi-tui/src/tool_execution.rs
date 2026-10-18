@@ -790,11 +790,14 @@ fn render_delegate(
     // One-line task brief from the tool arguments.
     let brief = delegate_task_brief(args_json);
     if !brief.is_empty() {
-        let brief_line = format!("  {}", colors.muted.fg(&truncate_to_width(
-            &brief,
-            width.saturating_sub(2).max(1),
-            "…",
-        )));
+        let brief_line = format!(
+            "  {}",
+            colors.muted.fg(&truncate_to_width(
+                &brief,
+                width.saturating_sub(2).max(1),
+                "…",
+            ))
+        );
         out.push(brief_line);
     }
 
@@ -822,12 +825,7 @@ fn render_delegate(
             Some("failed") => "子任务失败".to_string(),
             _ => "子任务已完成".to_string(),
         };
-        let line = format!(
-            "  {}",
-            colors
-                .dim
-                .fg(&format!("{label} · Ctrl+O 展开结果"))
-        );
+        let line = format!("  {}", colors.dim.fg(&format!("{label} · Ctrl+O 展开结果")));
         out.push(truncate_to_width(&line, width, "…"));
         return out;
     }
@@ -861,10 +859,7 @@ fn render_delegate(
 fn delegate_task_brief(args_json: &str) -> String {
     let task = crate::tool_execution::tools::extract_string_field(args_json, "task");
     // First line of the brief, whitespace-normalized.
-    let first = task
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
+    let first = task.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     first.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1630,7 +1625,10 @@ mod tests {
         comp.set_partial_result("执行 read");
         let running = comp.render(80);
         let plain = crate::ansi::strip_ansi(&running.join("\n"));
-        assert!(plain.contains("● luna · gpt-5.6-luna"), "identity header: {plain}");
+        assert!(
+            plain.contains("● luna · gpt-5.6-luna"),
+            "identity header: {plain}"
+        );
         assert!(plain.contains("检查子进程清理"), "task brief: {plain}");
         assert!(plain.contains("执行 read"), "live activity: {plain}");
         assert!(!plain.contains('✓'), "partial must not complete: {plain}");
@@ -1645,10 +1643,7 @@ mod tests {
 
         // Timeout → ⏱ even though the tool returned Ok (set_result with
         // is_error=false); the outcome label wins over the generic ✓.
-        let timeout = ToolExecutionComponent::new(
-            "delegate",
-            r#"{"agent":"luna","task":"t"}"#,
-        );
+        let timeout = ToolExecutionComponent::new("delegate", r#"{"agent":"luna","task":"t"}"#);
         timeout.set_delegate_info("luna", None);
         timeout.set_running();
         timeout.set_result("Sub-agent timeout…", false);
@@ -1665,7 +1660,10 @@ mod tests {
         cancelled.set_result("", false);
         cancelled.set_delegate_outcome("cancelled");
         let plain = crate::ansi::strip_ansi(&cancelled.render(80).join("\n"));
-        assert!(plain.contains('⊘') && !plain.contains('✓'), "cancelled: {plain}");
+        assert!(
+            plain.contains('⊘') && !plain.contains('✓'),
+            "cancelled: {plain}"
+        );
 
         let failed = ToolExecutionComponent::new("delegate", r#"{"agent":"l"}"#);
         failed.set_delegate_info("l", None);
@@ -1706,10 +1704,7 @@ mod tests {
 
         let collapsed = tool.render(80);
         let plain = crate::ansi::strip_ansi(&collapsed.join("\n"));
-        assert!(
-            plain.contains("⏵ release"),
-            "collapsed arrow+name: {plain}"
-        );
+        assert!(plain.contains("⏵ release"), "collapsed arrow+name: {plain}");
         assert!(plain.contains("(ctrl+o)"), "expand hint: {plain}");
         assert!(!plain.contains("Steps"), "collapsed hides body: {plain}");
         // Codex style: no background tint on the skill line.

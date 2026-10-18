@@ -3329,7 +3329,10 @@ mod tests {
             "reminder is marked metadata: {text}"
         );
         assert!(out.len() >= 2, "the original messages survive");
-        assert!(language_lock_convert(None).is_none(), "no lock = default path");
+        assert!(
+            language_lock_convert(None).is_none(),
+            "no lock = default path"
+        );
     }
 
     #[test]
@@ -3344,10 +3347,7 @@ mod tests {
             d.to_lowercase().contains("thinking"),
             "covers thinking blocks: {d}"
         );
-        assert!(
-            d.to_lowercase().contains("must"),
-            "imperative wording: {d}"
-        );
+        assert!(d.to_lowercase().contains("must"), "imperative wording: {d}");
     }
 
     #[test]

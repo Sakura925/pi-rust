@@ -693,7 +693,10 @@ pub(super) fn git_status_for(cwd: &std::path::Path) -> Option<String> {
     let mut untracked = 0usize;
     for line in text.lines() {
         if let Some(branch_info) = line.strip_prefix("## ") {
-            for part in branch_info.split(['[', ']']).filter(|s| s.contains("ahead") || s.contains("behind")) {
+            for part in branch_info
+                .split(['[', ']'])
+                .filter(|s| s.contains("ahead") || s.contains("behind"))
+            {
                 for piece in part.split(',') {
                     let piece = piece.trim();
                     if let Some(n) = piece.strip_prefix("ahead ") {

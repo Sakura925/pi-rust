@@ -261,8 +261,9 @@ impl SessionState {
                 if let LaneRecord::AssistantFrame(frame) = &record {
                     if frame.op == AssistantFrameOp::ClearRun {
                         let run_id = frame.run_id.clone();
-                        self.records
-                            .retain(|r| !matches!(r, LaneRecord::AssistantFrame(f) if f.run_id == run_id));
+                        self.records.retain(
+                            |r| !matches!(r, LaneRecord::AssistantFrame(f) if f.run_id == run_id),
+                        );
                         self.log.retain(|i| {
                             !matches!(
                                 i,

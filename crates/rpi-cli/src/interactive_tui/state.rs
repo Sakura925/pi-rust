@@ -1496,8 +1496,8 @@ mod paste_image_tests {
     fn valid_image_writes_file_and_returns_path() {
         let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let path = persist_pasted_image(&image("image/png", &data))
-            .expect("valid png data must persist");
+        let path =
+            persist_pasted_image(&image("image/png", &data)).expect("valid png data must persist");
         let stored = std::fs::read(&path).expect("file must be readable");
         assert_eq!(stored, bytes);
         // Extension follows the mime type; name carries the paste- prefix.

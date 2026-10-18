@@ -178,16 +178,22 @@ mod tests {
     fn label_shows_tail_then_checkmark() {
         let peek = ThinkingPeek::new();
 
-        let first = peek.update("analyzing\nthe module graph", false, 80).unwrap();
+        let first = peek
+            .update("analyzing\nthe module graph", false, 80)
+            .unwrap();
         assert!(first.contains("~ think"), "{first:?}");
         assert!(first.contains("the module graph"), "{first:?}");
 
         // 正文开始：落定 ✓
-        let done = peek.update("analyzing\nthe module graph", true, 80).unwrap();
+        let done = peek
+            .update("analyzing\nthe module graph", true, 80)
+            .unwrap();
         assert!(done.contains("✓"), "{done:?}");
 
         // 相同 label 不重复返回（避免每 delta 重建消息组件）
-        assert!(peek.update("analyzing\nthe module graph", true, 80).is_none());
+        assert!(peek
+            .update("analyzing\nthe module graph", true, 80)
+            .is_none());
     }
 
     #[test]

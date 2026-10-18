@@ -242,9 +242,7 @@ impl AgentTool for DelegateTool {
                  mechanical, verifiable work (read/search/edit/test/log collection) \
                  per the model-routing rules."
                     .to_string(),
-                parameters: Schema::new(
-                    serde_json::to_value(params).unwrap_or_default(),
-                ),
+                parameters: Schema::new(serde_json::to_value(params).unwrap_or_default()),
                 constrained_sampling: None,
             }
         })
@@ -267,9 +265,8 @@ impl AgentTool for DelegateTool {
         on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
         let _ = tool_call_id;
-        let input: DelegateTaskInput = serde_json::from_value(params).map_err(|e| {
-            AgentError::Tool(format!("delegate_task: invalid arguments: {e}"))
-        })?;
+        let input: DelegateTaskInput = serde_json::from_value(params)
+            .map_err(|e| AgentError::Tool(format!("delegate_task: invalid arguments: {e}")))?;
 
         let cwd = self.env.cwd().to_path_buf();
         // Resolve the agent definition — a role that matches no file is NOT an
@@ -282,8 +279,10 @@ impl AgentTool for DelegateTool {
             .unwrap_or_default();
 
         let model = input.model.clone().or(definition.model);
-        let timeout_seconds =
-            input.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS).max(1.0);
+        let timeout_seconds = input
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .max(1.0);
         let max_turns = input.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
         // System prompt: the agent definition body + the rules manifest (the
@@ -355,9 +354,7 @@ impl AgentTool for DelegateTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                AgentError::Tool(format!("delegate_task: spawn {:?}: {e}", exe))
-            })?;
+            .map_err(|e| AgentError::Tool(format!("delegate_task: spawn {:?}: {e}", exe)))?;
         let child_id = child.id();
 
         let stdout = child
@@ -439,9 +436,9 @@ impl AgentTool for DelegateTool {
                 }
                 let mut guard = reader_state.lock().unwrap();
                 guard.record_event(&line);
-                let should_flush = guard
-                    .last_flush
-                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(DELEGATE_UPDATE_THROTTLE_MS));
+                let should_flush = guard.last_flush.is_none_or(|t| {
+                    t.elapsed() >= Duration::from_millis(DELEGATE_UPDATE_THROTTLE_MS)
+                });
                 if should_flush {
                     guard.last_flush = Some(Instant::now());
                     // The partial payload is the CURRENT ACTIVITY — what the
@@ -674,7 +671,13 @@ mod tests {
         let manifest = rules_manifest(&base);
         let names: Vec<&str> = manifest
             .iter()
-            .map(|p| std::path::Path::new(p).file_name().unwrap().to_str().unwrap())
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(names, vec!["a.md", "b.md"]);
         let _ = std::fs::remove_dir_all(&base);
@@ -698,7 +701,8 @@ mod envelope_compat_tests {
             "timeoutSeconds": 120,
             "recursive": false
         });
-        let input: DelegateTaskInput = serde_json::from_value(raw).expect("envelope args must parse");
+        let input: DelegateTaskInput =
+            serde_json::from_value(raw).expect("envelope args must parse");
         assert_eq!(input.role, "luna-delegation-agent");
         assert_eq!(input.task, "sleep 30 and report");
         assert_eq!(input.max_turns, Some(4));

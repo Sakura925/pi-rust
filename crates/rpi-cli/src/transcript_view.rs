@@ -598,9 +598,9 @@ impl TranscriptView {
             let delegator_outcome = details
                 .and_then(|d| d.get("outcome"))
                 .and_then(Value::as_str);
-            if let Some(outcome) = delegator_outcome.filter(|_| {
-                matches!(name, "delegate" | "delegate_task")
-            }) {
+            if let Some(outcome) =
+                delegator_outcome.filter(|_| matches!(name, "delegate" | "delegate_task"))
+            {
                 // Four-way terminal state: completed / failed / timeout /
                 // cancelled — the panel reads this instead of assuming ✓.
                 comp.set_delegate_outcome(outcome);
@@ -807,11 +807,7 @@ pub fn tool_result_requests_markdown(details: Option<&Value>) -> bool {
 /// `agent · model · status/elapsed` header replaces the unstable
 /// first-field-of-args summary. Called from tool_start / tool_update when the
 /// component is created.
-fn apply_delegate_info(
-    comp: &Arc<ToolExecutionComponent>,
-    tool_name: &str,
-    args: &Value,
-) {
+fn apply_delegate_info(comp: &Arc<ToolExecutionComponent>, tool_name: &str, args: &Value) {
     // Match both delegators: the built-in `delegate` (rpi-tools, args carry
     // agent/model) AND the global extension's `delegate_task`
     // (librpi_subagents envelope style, args carry task/role/maxTurns).

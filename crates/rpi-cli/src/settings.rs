@@ -623,9 +623,7 @@ fn save_settings_to_path(
         ),
         (
             "disableUpdateCheck",
-            settings
-                .disable_update_check
-                .map(serde_json::Value::Bool),
+            settings.disable_update_check.map(serde_json::Value::Bool),
         ),
         (
             "quietStartup",
@@ -1070,7 +1068,8 @@ mod scoped_tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("\"disableUpdateCheck\": true") && text.contains("\"defaultModel\": \"keep-me\""),
+            text.contains("\"disableUpdateCheck\": true")
+                && text.contains("\"defaultModel\": \"keep-me\""),
             "save must overlay the flag without losing existing keys: {text}"
         );
         assert_eq!(load_settings().unwrap().disable_update_check, Some(true));

@@ -257,7 +257,9 @@ pub(super) fn open_extension_input(
     // input slot, so its result will degrade to a message instead of
     // opening UI over this fresh dialog.
     use std::sync::atomic::Ordering as _GenOrdering;
-    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
+    ctx.state
+        .dialog_generation
+        .fetch_add(1, _GenOrdering::AcqRel);
     let title = value
         .get("title")
         .and_then(|v| v.as_str())
@@ -359,7 +361,9 @@ pub(super) fn open_extension_selector(
     // input slot, so its result will degrade to a message instead of
     // opening UI over this fresh dialog.
     use std::sync::atomic::Ordering as _GenOrdering;
-    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
+    ctx.state
+        .dialog_generation
+        .fetch_add(1, _GenOrdering::AcqRel);
     let items = value
         .get("items")
         .and_then(|v| v.as_array())
@@ -478,7 +482,9 @@ pub(super) fn open_extension_editor(
     // input slot, so its result will degrade to a message instead of
     // opening UI over this fresh dialog.
     use std::sync::atomic::Ordering as _GenOrdering;
-    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
+    ctx.state
+        .dialog_generation
+        .fetch_add(1, _GenOrdering::AcqRel);
     let initial = value
         .get("initialText")
         .or_else(|| value.get("text"))
@@ -997,7 +1003,9 @@ pub(super) fn open_ask_user_input(
     // input slot, so its result will degrade to a message instead of
     // opening UI over this fresh dialog.
     use std::sync::atomic::Ordering as _GenOrdering;
-    ctx.state.dialog_generation.fetch_add(1, _GenOrdering::AcqRel);
+    ctx.state
+        .dialog_generation
+        .fetch_add(1, _GenOrdering::AcqRel);
     let placeholder = prompt
         .suggest
         .clone()

@@ -1100,9 +1100,7 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
     let agent_end_positions: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter_map(|(index, event)| {
-            matches!(event, AgentEvent::AgentEnd { .. }).then_some(index)
-        })
+        .filter_map(|(index, event)| matches!(event, AgentEvent::AgentEnd { .. }).then_some(index))
         .collect();
     assert_eq!(
         agent_end_positions.len(),
@@ -1111,13 +1109,15 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         agent_end_positions.len()
     );
     let only_end = agent_end_positions[0];
-    let handoff_message_start = events.iter().position(|event| matches!(
-        event,
-        AgentEvent::MessageStart {
-            message: AgentMessage::Assistant(assistant),
-        } if rpi_ai::types::Content::text_only(&assistant.content, "\n")
-            .contains("handoff: completed")
-    ));
+    let handoff_message_start = events.iter().position(|event| {
+        matches!(
+            event,
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(assistant),
+            } if rpi_ai::types::Content::text_only(&assistant.content, "\n")
+                .contains("handoff: completed")
+        )
+    });
     assert!(
         matches!(handoff_message_start, Some(start) if start < only_end),
         "the handoff must be emitted BEFORE the single AgentEnd; \
@@ -1126,11 +1126,9 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
     match &events[only_end] {
         AgentEvent::AgentEnd { messages } => assert!(
             messages.iter().any(|message| match message {
-                AgentMessage::Assistant(assistant) => rpi_ai::types::Content::text_only(
-                    &assistant.content,
-                    "\n",
-                )
-                .contains("handoff: completed"),
+                AgentMessage::Assistant(assistant) =>
+                    rpi_ai::types::Content::text_only(&assistant.content, "\n",)
+                        .contains("handoff: completed"),
                 _ => false,
             }),
             "the single AgentEnd must carry the handoff message"
@@ -1265,8 +1263,7 @@ async fn no_turn_ceiling_by_default_matches_native_pi() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn working_state_check_rides_the_run_without_breaking_it() {
     let previous = std::env::var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV).ok();
-    let previous_repeat =
-        std::env::var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV).ok();
+    let previous_repeat = std::env::var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV).ok();
     std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, "2");
     std::env::remove_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV);
 
@@ -1337,9 +1334,10 @@ async fn working_state_check_rides_the_run_without_breaking_it() {
     );
 
     match &previous {
-        Some(value) => {
-            std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, value)
-        }
+        Some(value) => std::env::set_var(
+            rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV,
+            value,
+        ),
         None => std::env::remove_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV),
     }
     match &previous_repeat {
@@ -1393,9 +1391,10 @@ async fn repeat_call_notice_nudges_without_stopping_the_run() {
         None => std::env::remove_var(rpi_harness::working_state::REPEAT_TOOL_REMINDER_ENV),
     }
     match &previous_interval {
-        Some(value) => {
-            std::env::set_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV, value)
-        }
+        Some(value) => std::env::set_var(
+            rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV,
+            value,
+        ),
         None => std::env::remove_var(rpi_harness::working_state::WORKING_STATE_INTERVAL_ENV),
     }
 }

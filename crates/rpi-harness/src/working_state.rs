@@ -231,9 +231,7 @@ fn tool_call_fingerprint(message: &AssistantMessage) -> Option<String> {
         .content
         .iter()
         .filter_map(|content| match content {
-            Content::ToolCall(call) => {
-                Some(format!("{}:{}", call.name, call.arguments))
-            }
+            Content::ToolCall(call) => Some(format!("{}:{}", call.name, call.arguments)),
             _ => None,
         })
         .collect();
@@ -368,24 +366,16 @@ mod tests {
                 })
             })
             .collect();
-        let mut message = AssistantMessage::empty(
-            rpi_ai::Api::OpenaiCompletions,
-            "provider",
-            "model",
-            0,
-        );
+        let mut message =
+            AssistantMessage::empty(rpi_ai::Api::OpenaiCompletions, "provider", "model", 0);
         message.content = content;
         message.stop_reason = StopReason::ToolUse;
         message
     }
 
     fn text_assistant() -> AssistantMessage {
-        let mut message = AssistantMessage::empty(
-            rpi_ai::Api::OpenaiCompletions,
-            "provider",
-            "model",
-            0,
-        );
+        let mut message =
+            AssistantMessage::empty(rpi_ai::Api::OpenaiCompletions, "provider", "model", 0);
         message.content = vec![Content::text("done")];
         message.stop_reason = StopReason::Stop;
         message
@@ -395,10 +385,8 @@ mod tests {
     fn status_check_fires_every_interval_turns() {
         let mut reminder = WorkingStateReminder::new(3, false);
         for turn in 1..=6 {
-            let fired = reminder.observe_turn(&assistant_with_calls(&[(
-                "bash",
-                r#"{"command":"ls"}"#,
-            )]));
+            let fired =
+                reminder.observe_turn(&assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)]));
             if turn % 3 == 0 {
                 assert_eq!(
                     fired,
@@ -438,26 +426,17 @@ mod tests {
     fn different_arguments_break_the_streak() {
         let mut reminder = WorkingStateReminder::new(0, true);
         assert_eq!(
-            reminder.observe_turn(&assistant_with_calls(&[(
-                "bash",
-                r#"{"command":"ls"}"#
-            )])),
+            reminder.observe_turn(&assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)])),
             None
         );
         assert_eq!(
-            reminder.observe_turn(&assistant_with_calls(&[(
-                "bash",
-                r#"{"command":"ls -a"}"#
-            )])),
+            reminder.observe_turn(&assistant_with_calls(&[("bash", r#"{"command":"ls -a"}"#)])),
             None
         );
         // Different args restarted the streak at 1, so even a third turn of
         // the *second* variant has only run twice.
         assert_eq!(
-            reminder.observe_turn(&assistant_with_calls(&[(
-                "bash",
-                r#"{"command":"ls -a"}"#
-            )])),
+            reminder.observe_turn(&assistant_with_calls(&[("bash", r#"{"command":"ls -a"}"#)])),
             None
         );
     }
@@ -486,7 +465,10 @@ mod tests {
         assert_eq!(reminder.observe_turn(&text_assistant()), None); // turn 3
         assert_eq!(
             reminder.observe_turn(&text_assistant()),
-            Some(Reminder::StatusCheck { turn: 4, interval: 4 })
+            Some(Reminder::StatusCheck {
+                turn: 4,
+                interval: 4
+            })
         );
         // The streak restarted after the break: two identical turns stay
         // quiet (streak 1 then 2, below the trigger of 3).
@@ -496,8 +478,7 @@ mod tests {
 
     #[test]
     fn from_env_defaults_to_disabled() {
-        let previous_interval =
-            std::env::var(WORKING_STATE_INTERVAL_ENV).ok();
+        let previous_interval = std::env::var(WORKING_STATE_INTERVAL_ENV).ok();
         let previous_repeat = std::env::var(REPEAT_TOOL_REMINDER_ENV).ok();
         let restore = || {
             match previous_interval {
@@ -555,9 +536,7 @@ mod tests {
         // notice means) must never be treated as transient — this was the
         // prefix-filter bug the first review found.
         let lookalike = AgentMessage::User(UserMessage::new(
-            UserContent::Text(
-                "[repeat notice] 这条提示是什么意思?请帮我关闭重复提醒。".into(),
-            ),
+            UserContent::Text("[repeat notice] 这条提示是什么意思?请帮我关闭重复提醒。".into()),
             123_456,
         ));
         let registry = reminder_registry();
@@ -658,9 +637,8 @@ mod tests {
     async fn wrap_passes_through_when_no_reminder_fires() {
         // Disabled reminder: the wrapper must be a transparent pipe.
         let state = Arc::new(Mutex::new(WorkingStateReminder::new(0, false)));
-        let inner: AfterToolResults = Arc::new(|_ctx: ShouldStopAfterTurnContext<'_>| {
-            Box::pin(async { None })
-        });
+        let inner: AfterToolResults =
+            Arc::new(|_ctx: ShouldStopAfterTurnContext<'_>| Box::pin(async { None }));
         let wrapped = wrap_after_tool_results(Some(inner), state, reminder_registry());
         let message = assistant_with_calls(&[("bash", r#"{"command":"ls"}"#)]);
         assert!(call_wrapped(&wrapped, &message).await.is_none());

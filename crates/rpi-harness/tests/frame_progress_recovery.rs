@@ -248,10 +248,7 @@ async fn a_cleared_run_salvages_nothing_from_disk() {
         .lines()
         .filter(|l| l.contains("\"type\":\"assistant_frame\""))
         .count();
-    assert_eq!(
-        frame_lines, 4,
-        "frames + the clear marker are all on disk"
-    );
+    assert_eq!(frame_lines, 4, "frames + the clear marker are all on disk");
 
     // ... but a finished run's frames no longer sit in memory (retired on
     // clear-run), so the in-memory query finds nothing ...
