@@ -74,7 +74,7 @@ When several sources are present, rpi checks them in this order:
 3. The provider's `apiKey` in `~/.rpi/agent/models.json`
 4. Environment variables
 
-Anthropic providers accept `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. OpenAI-compatible providers use `OPENAI_API_KEY` unless a custom provider configuration supplies another value. Credential checks do not make a network request:
+The built-in Anthropic provider accepts `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; built-in OpenAI uses `OPENAI_API_KEY`. DeepSeek is an optional package declaring `DEEPSEEK_API_KEY`. Provider packages declare their own `apiKeyEnv`; custom providers can explicitly reference a variable in `models.json`. Using an OpenAI-compatible protocol does not inherit `OPENAI_API_KEY`. See the [provider integration specification](../extensions/provider-integration.md). Credential checks do not make a network request:
 
 ```bash
 rpi auth check
@@ -249,6 +249,8 @@ rpi install rpi-extension-example
 rpi install rpi-extension-example --version 0.1.0
 rpi install my-extension --path ../my-rpi-extension --force
 ```
+
+`rpi install <name>` upgrades newer versions directly and skips an already installed version. Use `--force` to reinstall the same version or allow a downgrade. This also applies to Cargo builds and local installs; local changes without a version bump require `--force`.
 
 For iterative development:
 

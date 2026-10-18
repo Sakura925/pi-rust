@@ -220,6 +220,8 @@ macOS 的行为与 main-screen 的终端原生 scrollback 不同：alternate-scr
 
 支持 Kitty 键盘协议的终端使用与 Pi 一致的 flags 7，启用修饰键识别及功能键重复、松键事件。普通文本保留 UTF-8 输入，保证 iTerm2 等终端的中文输入法可以正常提交文字；不启用把所有文本转成按键事件的 flag 8。普通字符键（例如空格）的松键事件不作保证，依赖按住操作的插件应使用终端支持松键事件的功能键。协议在切换到当前屏幕后开启，并在退出或挂起前恢复；恢复运行时也会重新启用全屏鼠标滚动。
 
+macOS 默认同样开启协议，因为 `Shift+Enter` 依赖它区分于 `Enter`；只有开启协议后输入法无法上屏的终端（如 Otty）退回传统输入。`RPI_KITTY_KEYBOARD=1` 可强制开启，`RPI_KITTY_KEYBOARD=0` 可强制回退传统输入。
+
 本地 Terminal.app 的 `Shift+Enter` 使用 macOS 原生 Shift 状态补足换行识别，普通 `Enter` 继续发送。SSH 会话不会读取本机 Shift 状态。未支持增强键盘协议的终端仍使用传统输入，按住快捷键等依赖松键事件的功能需要终端支持。
 
 插件输入框、编辑器、选择器和历史搜索打开时优先接收输入，插件全局快捷键不会抢走这些窗口的按键。已被插件接管的按键仍会收到对应的松键事件，避免按住状态卡住。浮层按实际宽度排版，并避开输入框和页脚；多个被动面板在空间足够时自动纵向避让，窗口过小时暂时隐藏放不下的面板。需要避免浮层遮住聊天正文时可关闭面板，或使用插件的 sidebar 布局。
@@ -325,8 +327,10 @@ rpi --extensions-dir target/debug -p 'echo "hi"'
 ```bash
 rpi install rpi-todo
 rpi install rpi-todo --version 0.2.0
-rpi install rpi-todo --force
+rpi install rpi-todo --force # 同版本重装
 ```
+
+`rpi install <包名>` 可直接安装或升级；目标版本已安装时会提示并跳过。同版本重装或降级需要 `--force`。源码构建也遵循这一规则，本地开发修改代码但未更改版本时，使用 `--force` 重装。
 
 安装器从 crates.io 选择最新未撤回的稳定版本，并用包的 `repository` 元数据找到 GitHub 仓库，再读取 `<包名>-v<版本>` Release 中的 `rpi-extension.json`。它按精确目标三元组匹配预编译文件，校验压缩包大小和 SHA-256、解压后的库文件 SHA-256、平台架构及声明的 SDK ABI。库文件名以 manifest 的 `library.path` 为准。同一仓库里的扩展可以独立版本发布。
 

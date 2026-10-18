@@ -33,6 +33,7 @@ pub struct OpenAiCompletionsProvider {
     id: String,
     api_key: Option<String>,
     allow_env_api_key: bool,
+    require_auth: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -50,6 +51,7 @@ impl OpenAiCompletionsProvider {
             id,
             api_key,
             allow_env_api_key,
+            require_auth: true,
             http,
             models,
         }
@@ -67,9 +69,22 @@ impl OpenAiCompletionsProvider {
             id: id.into(),
             api_key,
             allow_env_api_key: false,
+            require_auth: true,
             http,
             models,
         }
+    }
+
+    /// Explicit opt-in for local or proxy endpoints that accept anonymous
+    /// requests. Never inherits the OpenAI environment credential.
+    pub fn with_models_without_auth(
+        id: impl Into<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
+        let mut provider = Self::with_models_without_env_api_key(id, None, http, models);
+        provider.require_auth = false;
+        provider
     }
 }
 
@@ -93,6 +108,7 @@ impl Provider for OpenAiCompletionsProvider {
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
         let allow_env_api_key = self.allow_env_api_key;
+        let require_auth = self.require_auth;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         let opts = opts.clone();
@@ -103,6 +119,7 @@ impl Provider for OpenAiCompletionsProvider {
                 http,
                 provider_key,
                 allow_env_api_key,
+                require_auth,
                 &model,
                 &ctx,
                 &opts,
@@ -119,6 +136,7 @@ async fn run_stream(
     http: reqwest::Client,
     provider_key: Option<String>,
     allow_env_api_key: bool,
+    require_auth: bool,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -136,7 +154,7 @@ async fn run_stream(
     // Identify rpi on provider requests (native `getPiUserAgent`), unless the
     // caller/model already set a User-Agent.
     crate::http::ensure_user_agent(&mut headers);
-    if !has_auth_header(&headers) {
+    if require_auth && !has_auth_header(&headers) {
         state.error(
             producer,
             format!("No API key for provider: {}", model.provider),
@@ -328,6 +346,18 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                 if !tool_calls.is_empty() {
                     value["tool_calls"] = Value::Array(tool_calls);
                 }
+                if compat(model).and_then(|compat| compat.requires_reasoning_content) == Some(true)
+                {
+                    let reasoning: String = message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Thinking(thinking) => Some(thinking.thinking.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    value["reasoning_content"] = Value::String(reasoning);
+                }
                 messages.push(value);
                 last_was_tool_result = false;
             }
@@ -387,7 +417,7 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
         body.insert("temperature".into(), Value::from(temperature));
     }
     if model.reasoning && supports_reasoning_effort(model) {
-        if let Some(effort) = mapped_reasoning_effort(model, opts.reasoning_level()) {
+        if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
             body.insert("reasoning_effort".into(), Value::String(effort));
         }
     }
@@ -559,34 +589,19 @@ fn max_tokens_field(model: &Model) -> &'static str {
     }
 }
 
-fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
-    match level {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
-    }
-}
-
-/// Resolve the `reasoning_effort` string for `model` at `level`.
-///
-/// Mirrors the TS provider's `model.thinkingLevelMap?.[effort] ?? effort`: the
-/// per-model map wins when it carries a non-null string for the level
-/// (e.g. `{"max": "max"}` sends `"max"`), otherwise the built-in table above.
-fn mapped_reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
-    let built_in = reasoning_effort(level)?;
+fn reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
     if let Some(map) = &model.thinking_level_map {
-        if let Some(Some(value)) = map.get(&level).as_ref() {
-            if !value.is_empty() {
-                return Some(value.clone());
-            }
-            // Empty strings fall through to the built-in table; explicit
-            // null keeps the level hidden upstream, but at the request layer
-            // the built-in value is still the safest fallback.
+        if let Some(mapped) = map.get(&level) {
+            return mapped.clone();
         }
     }
-    Some(built_in.to_string())
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some("minimal".into()),
+        ThinkingLevel::Low => Some("low".into()),
+        ThinkingLevel::Medium => Some("medium".into()),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high".into()),
+    }
 }
 
 fn has_auth_header(headers: &BTreeMap<String, String>) -> bool {
@@ -1353,14 +1368,19 @@ mod tests {
             parameters: json!({ "type": "object" }).into(),
             constrained_sampling: None,
         });
+        let mut model = model();
+        model.thinking_level_map = Some(BTreeMap::from([(
+            ThinkingLevel::Xhigh,
+            Some("xhigh".into()),
+        )]));
         let mut opts = SimpleStreamOptions::default();
-        opts.reasoning = Some(ThinkingLevel::High);
-        let body = build_request(&model(), &context, &opts);
+        opts.reasoning = Some(ThinkingLevel::Xhigh);
+        let body = build_request(&model, &context, &opts);
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "xhigh");
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream_options"]["include_usage"], true);
     }
@@ -1393,6 +1413,42 @@ mod tests {
         assert!(messages
             .iter()
             .all(|message| message["role"] != "assistant"));
+    }
+
+    #[test]
+    fn reasoning_content_replay_is_explicit_and_preserves_all_assistant_turns() {
+        let mut model = model();
+        let mut assistant =
+            AssistantMessage::empty(Api::OpenaiCompletions, "gateway", "gpt-test", 1);
+        assistant.content = vec![
+            Content::thinking("first reasoning"),
+            Content::thinking(" and continuation"),
+            Content::text("answer"),
+        ];
+        let mut plain = assistant.clone();
+        plain.content = vec![Content::text("plain answer")];
+        let ctx = Context::new(vec![
+            Message::Assistant(Box::new(assistant)),
+            Message::Assistant(Box::new(plain)),
+        ]);
+        let ordinary = build_request(&model, &ctx, &SimpleStreamOptions::default());
+        assert!(ordinary["messages"][0].get("reasoning_content").is_none());
+        assert!(!crate::model::prior_reasoning_is_replayed(&model));
+
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                requires_reasoning_content: Some(true),
+                ..Default::default()
+            },
+        ));
+        let replayed = build_request(&model, &ctx, &SimpleStreamOptions::default());
+        assert_eq!(replayed["messages"][0]["content"], "answer");
+        assert_eq!(
+            replayed["messages"][0]["reasoning_content"],
+            "first reasoning and continuation"
+        );
+        assert_eq!(replayed["messages"][1]["reasoning_content"], "");
+        assert!(crate::model::prior_reasoning_is_replayed(&model));
     }
 
     #[test]

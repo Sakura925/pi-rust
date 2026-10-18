@@ -123,14 +123,13 @@ pub(super) fn add_update_notices(
 
     for notice in report.notices.iter().filter(|notice| notice.name != "rpi") {
         let body = format!(
-            "{}\n{} {}{}",
+            "{}\n{} {}",
             colors.muted.fg(&format!(
                 "{} {} -> {}",
                 notice.name, notice.current, notice.latest
             )),
             colors.muted.fg("Run"),
-            colors.accent.fg(&notice.command),
-            colors.muted.fg(".")
+            colors.accent.fg(&notice.command)
         );
         add_update_panel(&group, "Package Update Available", &body, colors.warning);
     }
@@ -193,7 +192,10 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/version, /v", "Show version information"),
         ("/changelog", "Show recent release changes"),
         ("/model, /m", "Choose a model (live switch)"),
-        ("/provider", "Add, remove, or set the default provider"),
+        (
+            "/provider",
+            "Switch provider now, or add/remove provider configuration",
+        ),
         ("/thinking, /think", "Set reasoning depth (selector)"),
         ("/tools", "Toggle built-in tools on/off"),
         ("/images", "Toggle inline image rendering"),

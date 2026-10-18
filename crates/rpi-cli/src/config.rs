@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat};
+use rpi_ai::{Api, InputModality, Model, ModelCost, StreamingProtocolCompat, ThinkingLevelMap};
 
 /// The config directory name under the home dir.
 pub const CONFIG_DIR_NAME: &str = ".rpi";
@@ -387,9 +387,14 @@ pub struct ModelDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// USD per million tokens, including optional long-context pricing tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
     /// Free-form modality strings ("text"/"image"); unknown values fall back
     /// to text-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,12 +403,6 @@ pub struct ModelDefinition {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<serde_json::Value>,
-    /// Per-model thinking-level → provider-effort map (camelCase keys: off,
-    /// minimal, low, medium, high, xhigh, max; null = unsupported).
-    /// Without this field the config layer dropped the user's map entirely —
-    /// the fourth porting gap from TS pi-ai.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_level_map: Option<serde_json::Value>,
     /// Per-level thinking budgets (tokens) for budget-based reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budgets: Option<serde_json::Value>,
@@ -849,38 +848,7 @@ pub fn openai_provider_api_key(provider_id: &str, cfg: &ProviderConfig) -> Optio
 /// provider's credential.
 fn native_provider_api_key_env_var(provider_id: &str) -> Option<&'static str> {
     match provider_id {
-        "ant-ling" => Some("ANT_LING_API_KEY"),
-        "qwen-token-plan" | "qwen-token-plan-individual" => Some("QWEN_TOKEN_PLAN_API_KEY"),
-        "qwen-token-plan-cn" => Some("QWEN_TOKEN_PLAN_CN_API_KEY"),
-        "openai" => Some("OPENAI_API_KEY"),
-        "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
-        "nvidia" => Some("NVIDIA_API_KEY"),
-        "deepseek" => Some("DEEPSEEK_API_KEY"),
-        "google" => Some("GEMINI_API_KEY"),
-        "google-vertex" => Some("GOOGLE_CLOUD_API_KEY"),
-        "groq" => Some("GROQ_API_KEY"),
-        "cerebras" => Some("CEREBRAS_API_KEY"),
-        "xai" => Some("XAI_API_KEY"),
-        "radius" => Some("RADIUS_API_KEY"),
-        "openrouter" => Some("OPENROUTER_API_KEY"),
-        "vercel-ai-gateway" => Some("AI_GATEWAY_API_KEY"),
-        "zai" => Some("ZAI_API_KEY"),
-        "zai-coding-cn" => Some("ZAI_CODING_CN_API_KEY"),
-        "mistral" => Some("MISTRAL_API_KEY"),
-        "minimax" => Some("MINIMAX_API_KEY"),
-        "minimax-cn" => Some("MINIMAX_CN_API_KEY"),
-        "moonshotai" | "moonshotai-cn" => Some("MOONSHOT_API_KEY"),
-        "huggingface" => Some("HF_TOKEN"),
-        "fireworks" => Some("FIREWORKS_API_KEY"),
-        "together" => Some("TOGETHER_API_KEY"),
-        "baseten" => Some("BASETEN_API_KEY"),
-        "opencode" | "opencode-go" => Some("OPENCODE_API_KEY"),
-        "kimi-coding" => Some("KIMI_API_KEY"),
-        "cloudflare-workers-ai" | "cloudflare-ai-gateway" => Some("CLOUDFLARE_API_KEY"),
-        "xiaomi" => Some("XIAOMI_API_KEY"),
-        "xiaomi-token-plan-cn" => Some("XIAOMI_TOKEN_PLAN_CN_API_KEY"),
-        "xiaomi-token-plan-ams" => Some("XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
-        "xiaomi-token-plan-sgp" => Some("XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        "openai" => crate::credentials::builtin_api_key_env(provider_id),
         _ => None,
     }
 }
@@ -917,17 +885,17 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
             base_url,
         );
         m.reasoning = def.reasoning.unwrap_or(false);
+        m.thinking_level_map = def.thinking_level_map.clone();
         m.context_window = def.context_window.unwrap_or(0);
         m.max_tokens = def.max_tokens.unwrap_or(0);
-        if let Some(value) = def.thinking_level_map.clone() {
-            if let Ok(map) = serde_json::from_value(value) {
-                m.thinking_level_map = Some(map);
-            }
-        }
         if let Some(value) = def.thinking_budgets.clone() {
             if let Ok(budgets) = serde_json::from_value(value) {
                 m.thinking_budgets = Some(budgets);
             }
+        }
+        if let Some(cost) = &def.cost {
+            m.cost = cost.clone();
+            m.cost_configured = true;
         }
         m.input = parse_input_modalities(def.input.as_deref());
         // Merge: model-level headers, then provider-level headers (provider wins
@@ -937,7 +905,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         // referencing env vars / commands resolves the same way. Models.json
         // providers have no credential env overlay (only auth.json keys do), so
         // the expansion is env-only here.
-        // NOTE: the `authHeader:true` Bearer synthesis is NOT done here —
+        // Credential-derived headers are NOT synthesized in the catalog —
         // [`crate::provider::resolve`] applies it centrally so it can skip it
         // when a higher-priority x-api-key source (`--api-key` / auth.json /
         // `ANTHROPIC_API_KEY`) wins. Folding it here unconditionally would put a
@@ -955,10 +923,6 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
             }
         }
         if matches!(api, Api::OpenaiCompletions | Api::OpenaiResponses) {
-            if let Some(key) = openai_provider_api_key(provider_id, cfg) {
-                headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
-                headers.insert("authorization".to_string(), format!("Bearer {key}"));
-            }
             if let Some(value) = def.compat.clone() {
                 if matches!(api, Api::OpenaiResponses) {
                     if let Ok(compat) = serde_json::from_value(value) {
@@ -1309,12 +1273,13 @@ mod tests {
                 name: None,
                 base_url: None,
                 reasoning: None,
+                thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
+                cost: None,
                 input: None,
                 headers: None,
                 compat: None,
-                thinking_level_map: None,
                 thinking_budgets: None,
             }],
         };
@@ -1360,13 +1325,80 @@ mod tests {
         assert_eq!(models[0].api, Api::OpenaiCompletions);
         assert_eq!(models[0].provider, "oai");
         assert_eq!(models[0].max_tokens, 4096);
+        assert_eq!(models[0].cost, ModelCost::default());
+        assert!(!models[0].has_pricing());
+        assert!(
+            models[0].headers.is_none(),
+            "credentials are bound after provider resolution"
+        );
+    }
+
+    #[test]
+    fn models_json_pricing_reaches_providers_and_survives_serialization() {
+        let mut config = parse_models_json(
+            r#"{
+                "providers": {
+                    "pricing-fixture": {
+                        "api": "anthropic-messages",
+                        "models": [{
+                            "id": "priced-model",
+                            "cost": {
+                                "input": 2, "output": 8, "cacheRead": 0.2, "cacheWrite": 2.5,
+                                "tiers": [{
+                                    "inputTokensAbove": 1000000,
+                                    "input": 4, "output": 16, "cacheRead": 0.4, "cacheWrite": 5
+                                }]
+                            }
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let expected = config.providers["pricing-fixture"].models[0]
+            .cost
+            .clone()
+            .unwrap();
+        for api in [
+            "anthropic-messages",
+            "openai-completions",
+            "openai-responses",
+        ] {
+            let cfg = config.providers.get_mut("pricing-fixture").unwrap();
+            cfg.api = Some(api.into());
+            let models = provider_to_models("pricing-fixture", cfg).unwrap();
+            assert_eq!(models[0].cost, expected);
+            assert!(models[0].has_pricing());
+            let mut usage = rpi_ai::Usage::zero();
+            usage.input = 100_000;
+            usage.output = 250_000;
+            usage.cache_read = 300_000;
+            usage.cache_write = 400_000;
+            let cost = rpi_ai::providers::anthropic::cost::calculate_cost(&models[0].cost, &usage);
+            assert!((cost.total - 3.26).abs() < 1e-10, "base pricing for {api}");
+            usage.input = 1_000_001;
+            usage.output = 1_000_000;
+            usage.cache_read = 0;
+            usage.cache_write = 0;
+            let cost = rpi_ai::providers::anthropic::cost::calculate_cost(&models[0].cost, &usage);
+            assert!(
+                (cost.total - 20.000004).abs() < 1e-10,
+                "tiered pricing for {api}"
+            );
+        }
+        let saved = serde_json::to_string(&config).unwrap();
+        let reloaded = parse_models_json(&saved).unwrap();
         assert_eq!(
-            models[0]
-                .headers
-                .as_ref()
-                .and_then(|headers| headers.get("authorization"))
-                .map(String::as_str),
-            Some("Bearer secret")
+            reloaded.providers["pricing-fixture"].models[0].cost,
+            Some(expected)
+        );
+        let cfg = config.providers.get_mut("pricing-fixture").unwrap();
+        cfg.models[0].cost = Some(ModelCost::default());
+        let free = provider_to_models("pricing-fixture", cfg).unwrap();
+        assert_eq!(free[0].cost, ModelCost::default());
+        assert!(
+            free[0].has_pricing(),
+            "explicit zero prices are still configured"
         );
     }
 
@@ -1388,6 +1420,7 @@ mod tests {
                         "models": [{
                             "id": "qwen3.7-plus",
                             "maxTokens": 131072,
+                            "thinkingLevelMap": { "xhigh": "xhigh", "max": "max" },
                             "compat": { "requiresThinkingAsText": true }
                         }]
                     }
@@ -1396,6 +1429,14 @@ mod tests {
         )
         .unwrap();
         let models = provider_to_models("qwen", &config.providers["qwen"]).unwrap();
+        assert_eq!(
+            models[0]
+                .thinking_level_map
+                .as_ref()
+                .unwrap()
+                .get(&rpi_ai::ThinkingLevel::Xhigh),
+            Some(&Some("xhigh".into()))
+        );
         match models[0].compat.as_ref().expect("compat must survive") {
             StreamingProtocolCompat::OpenaiCompletions(compat) => {
                 assert_eq!(compat.requires_thinking_as_text, Some(true));
@@ -1438,23 +1479,24 @@ mod tests {
                 name: None,
                 base_url: None,
                 reasoning: None,
+                thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
+                cost: None,
                 input: None,
                 headers: None,
                 compat: None,
-                thinking_level_map: None,
                 thinking_budgets: None,
             }],
         };
         let models = provider_to_models("rpi-fake-provider", &cfg).unwrap();
         assert_eq!(
-            models[0]
-                .headers
-                .as_ref()
-                .and_then(|headers| headers.get("authorization"))
-                .map(String::as_str),
-            Some("Bearer env-secret")
+            openai_provider_api_key("rpi-fake-provider", &cfg).as_deref(),
+            Some("env-secret")
+        );
+        assert!(
+            models[0].headers.is_none(),
+            "discovery does not bind credentials"
         );
         std::env::remove_var(env_name);
     }
@@ -1493,64 +1535,24 @@ mod tests {
 
     #[test]
     fn native_provider_api_key_env_mapping_uses_exact_provider_ids() {
-        for (provider, env_var) in [
-            ("ant-ling", "ANT_LING_API_KEY"),
-            ("qwen-token-plan", "QWEN_TOKEN_PLAN_API_KEY"),
-            ("qwen-token-plan-cn", "QWEN_TOKEN_PLAN_CN_API_KEY"),
-            ("qwen-token-plan-individual", "QWEN_TOKEN_PLAN_API_KEY"),
-            ("openai", "OPENAI_API_KEY"),
-            ("azure-openai-responses", "AZURE_OPENAI_API_KEY"),
-            ("nvidia", "NVIDIA_API_KEY"),
-            ("deepseek", "DEEPSEEK_API_KEY"),
-            ("google", "GEMINI_API_KEY"),
-            ("google-vertex", "GOOGLE_CLOUD_API_KEY"),
-            ("groq", "GROQ_API_KEY"),
-            ("cerebras", "CEREBRAS_API_KEY"),
-            ("xai", "XAI_API_KEY"),
-            ("radius", "RADIUS_API_KEY"),
-            ("openrouter", "OPENROUTER_API_KEY"),
-            ("vercel-ai-gateway", "AI_GATEWAY_API_KEY"),
-            ("zai", "ZAI_API_KEY"),
-            ("zai-coding-cn", "ZAI_CODING_CN_API_KEY"),
-            ("mistral", "MISTRAL_API_KEY"),
-            ("minimax", "MINIMAX_API_KEY"),
-            ("minimax-cn", "MINIMAX_CN_API_KEY"),
-            ("moonshotai", "MOONSHOT_API_KEY"),
-            ("moonshotai-cn", "MOONSHOT_API_KEY"),
-            ("huggingface", "HF_TOKEN"),
-            ("fireworks", "FIREWORKS_API_KEY"),
-            ("together", "TOGETHER_API_KEY"),
-            ("baseten", "BASETEN_API_KEY"),
-            ("opencode", "OPENCODE_API_KEY"),
-            ("opencode-go", "OPENCODE_API_KEY"),
-            ("kimi-coding", "KIMI_API_KEY"),
-            ("cloudflare-workers-ai", "CLOUDFLARE_API_KEY"),
-            ("cloudflare-ai-gateway", "CLOUDFLARE_API_KEY"),
-            ("xiaomi", "XIAOMI_API_KEY"),
-            ("xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY"),
-            ("xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
-            ("xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        assert_eq!(
+            native_provider_api_key_env_var("openai"),
+            Some("OPENAI_API_KEY")
+        );
+        for provider in [
+            "deepseek",
+            "openrouter",
+            "google",
+            "groq",
+            "qwen",
+            "nvidia",
+            "OpenAI",
+            "openai-completions",
         ] {
             assert_eq!(
                 native_provider_api_key_env_var(provider),
-                Some(env_var),
-                "unexpected env mapping for {provider}"
-            );
-        }
-
-        for alias in [
-            "togetherai",
-            "perplexity",
-            "moonshot",
-            "kimi",
-            "qwen",
-            "zhipu",
-            "OpenAI",
-        ] {
-            assert_eq!(
-                native_provider_api_key_env_var(alias),
                 None,
-                "non-native alias {alias} must not inherit credentials"
+                "external providers must declare auth in their package or models.json"
             );
         }
     }

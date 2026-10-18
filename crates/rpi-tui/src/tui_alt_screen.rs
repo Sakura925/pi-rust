@@ -651,9 +651,7 @@ impl TuiAltScreen {
                     }
                     // Only m-terminated SGR can be neutral; other CSI (moves,
                     // erases) is positional and must be repainted.
-                    let Some(end) = rest[2..]
-                        .bytes()
-                        .position(|b| (0x40..=0x7e).contains(&b))
+                    let Some(end) = rest[2..].bytes().position(|b| (0x40..=0x7e).contains(&b))
                     else {
                         return false;
                     };
@@ -661,9 +659,10 @@ impl TuiAltScreen {
                         return false;
                     }
                     let params = &rest[2..2 + end];
-                    if !params.split(';').all(|p| {
-                        matches!(p, "" | "0" | "m" | "22" | "39" | "49")
-                    }) {
+                    if !params
+                        .split(';')
+                        .all(|p| matches!(p, "" | "0" | "m" | "22" | "39" | "49"))
+                    {
                         return false;
                     }
                     i += 3 + end;
@@ -716,14 +715,31 @@ impl TuiAltScreen {
             &previous, &lines,
         ));
 
-        // Size changes alter wrapping or viewport coordinates everywhere;
-        // mirror upstream and rebuild once. Normal streaming updates stay
-        // incremental and preserve terminal scrollback.
+        let mut first_changed = None;
+        let mut last_changed = None;
+        for index in 0..previous.len().max(lines.len()) {
+            if previous.get(index) != lines.get(index) {
+                first_changed.get_or_insert(index);
+                last_changed = Some(index);
+            }
+        }
+        let viewport_top = *self.main_viewport_top.lock().unwrap();
+        let changed_in_scrollback = first_changed.is_some_and(|first| {
+            first < viewport_top || lines.len().saturating_sub(1) < viewport_top
+        });
+
+        // Saved scrollback cannot be addressed by cursor movement or CSI T:
+        // SD only inserts blanks in the live screen. Rebuild the document when
+        // an old row changes, otherwise repainting its tail appends duplicate
+        // history until a bounded terminal buffer evicts the conversation start.
+        // Size changes also require a rebuild; ordinary screen-local updates
+        // remain incremental.
         if (previous_width != 0 && previous_width != width)
             || (previous_height != 0 && previous_height != height)
+            || changed_in_scrollback
         {
-            terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write("\x1b[?2026h");
+            terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
@@ -735,15 +751,6 @@ impl TuiAltScreen {
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
-            let mut first_changed = None;
-            let mut last_changed = None;
-            let max = previous.len().max(lines.len());
-            for index in 0..max {
-                if previous.get(index) != lines.get(index) {
-                    first_changed.get_or_insert(index);
-                    last_changed = Some(index);
-                }
-            }
             if first_changed.is_none() && cursor == previous_cursor {
                 return;
             }
@@ -761,78 +768,29 @@ impl TuiAltScreen {
                     first
                 };
                 let mut output = String::from("\x1b[?2026h");
-                let mut force_tail_repaint = false;
-                let mut healed = false;
-                if move_target < viewport_top {
-                    // The changed range starts above the visible viewport (e.g.
-                    // a long streamed message re-wrapping above the visible
-                    // tail). Scroll the viewport up so the write lands on the
-                    // correct document rows; without this the cursor clamps to
-                    // the top row and the transcript is painted over the dock,
-                    // while `advanced` under-counts the real scroll and corrupts
-                    // `main_viewport_top`/`main_hardware_row` for later frames.
-                    //
-                    // SD leaves the rows below the rewritten range blank, so
-                    // when the rewrite does NOT reach the document tail (an
-                    // in-place edit above the viewport) those rows must still be
-                    // repainted — force the write range through the last line.
-                    force_tail_repaint = true;
-                    let scroll = viewport_top - move_target;
-                    output.push_str("\x1b[H");
-                    output.push_str(&format!("\x1b[{scroll}T"));
-                    viewport_top = move_target;
-                    hardware_row = move_target;
-                } else if move_target > viewport_bottom {
+                if move_target > viewport_bottom {
+                    let current_screen = hardware_row
+                        .saturating_sub(viewport_top)
+                        .min(height.saturating_sub(1));
+                    let down = height.saturating_sub(1).saturating_sub(current_screen);
+                    if down > 0 {
+                        output.push_str(&format!("\x1b[{down}B"));
+                    }
                     let scroll = move_target - viewport_bottom;
-                    if scroll > height {
-                        // Self-heal a runaway scroll. A `scroll` larger than a
-                        // full screen means the viewport tracking drifted from
-                        // the real terminal (foreign output while suspended,
-                        // size churn, or a state reset). Replaying `\r\n` per
-                        // row would blank the visible viewport while the real
-                        // content only lives on in the scrollback, so repaint
-                        // the whole document instead and resynchronize the
-                        // tracked viewport.
-                        output.push_str("\x1b[?2026l");
-                        output.push_str("\x1b[?2026h");
-                        output.push_str(&lines.join("\r\n"));
-                        output.push_str("\x1b[?2026l");
-                        hardware_row = lines.len().saturating_sub(1);
-                        viewport_top = lines.len().saturating_sub(height);
-                        healed = true;
-                    } else {
-                        let current_screen = hardware_row
-                            .saturating_sub(viewport_top)
-                            .min(height.saturating_sub(1));
-                        let down =
-                            height.saturating_sub(1).saturating_sub(current_screen);
-                        if down > 0 {
-                            output.push_str(&format!("\x1b[{down}B"));
-                        }
-                        output.push_str(&"\r\n".repeat(scroll));
-                        viewport_top += scroll;
-                        hardware_row = move_target;
-                    }
+                    output.push_str(&"\r\n".repeat(scroll));
+                    viewport_top += scroll;
+                    hardware_row = move_target;
                 }
-                // 自愈重发后光标已在文档末行行尾（hardware_row 与 viewport_top
-                // 已重置同步）；跳过面向 diff 写入的增量定位，否则光标会被
-                // 移到 move_target 而内容不再写入，实际位置与内部记录再次
-                // 失配。
-                if !healed {
-                    let current_screen = hardware_row.saturating_sub(viewport_top);
-                    let target_screen = move_target.saturating_sub(viewport_top);
-                    if target_screen > current_screen {
-                        output.push_str(&format!("\x1b[{}B", target_screen - current_screen));
-                    } else if current_screen > target_screen {
-                        output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
-                    }
-                    output.push_str(if append_start { "\r\n" } else { "\r" });
+                let current_screen = hardware_row.saturating_sub(viewport_top);
+                let target_screen = move_target.saturating_sub(viewport_top);
+                if target_screen > current_screen {
+                    output.push_str(&format!("\x1b[{}B", target_screen - current_screen));
+                } else if current_screen > target_screen {
+                    output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
                 }
-                let mut render_end = last.min(lines.len().saturating_sub(1));
-                if force_tail_repaint {
-                    render_end = lines.len().saturating_sub(1);
-                }
-                if !deleted_tail_only && !healed {
+                output.push_str(if append_start { "\r\n" } else { "\r" });
+                let render_end = last.min(lines.len().saturating_sub(1));
+                if !deleted_tail_only {
                     for index in first..=render_end {
                         if index > first {
                             output.push_str("\r\n");
@@ -864,9 +822,7 @@ impl TuiAltScreen {
                     }
                 }
                 let mut final_row = render_end;
-                if healed {
-                    final_row = lines.len().saturating_sub(1);
-                } else if previous.len() > lines.len() {
+                if previous.len() > lines.len() {
                     let extra_lines = previous.len() - lines.len();
                     let clear_start_offset = usize::from(!lines.is_empty());
                     if clear_start_offset > 0 {
@@ -1808,7 +1764,12 @@ mod tests {
     }
 
     #[test]
-    fn regular_mode_heals_runaway_scrolls_with_full_repaint() {
+    fn regular_mode_rebuilds_when_scrollback_rows_change() {
+        // e59a6bb 契约：变更起点落在已固化进 scrollback 的行
+        // （first_changed < viewport_top）时放弃增量渲染——已固化的历史行
+        // 无法被光标移动或 CSI T 寻址（SD 只在活动屏内插空行），尾部增量
+        // 重写只会把历史内容重复追加一遍（2026-10-18 runloom 长会话实证：
+        // 每条长回复在终端上重复两遍）。必须走清屏 + 全文档重建。
         let output = Arc::new(Mutex::new(String::new()));
         let terminal = RecordingTerminal {
             output: output.clone(),
@@ -1825,31 +1786,35 @@ mod tests {
         tui.set_main_screen_mode(true);
         tui.set_layout_root(Some(content.clone()));
         tui.start_readerless();
-        tui.do_render(false);
+        tui.do_render(false); // 首帧：60 行文档，viewport_top = 60 - 8
         output.lock().unwrap().clear();
 
-        // 模拟视口跟踪漂移（外部输出 / 挂起渲染 / 尺寸抖动后的状态失真）：
-        // 跟踪状态以为视口还在文档顶部，真实终端已在底部。
-        *tui.main_viewport_top.lock().unwrap() = 0;
-        *tui.main_hardware_row.lock().unwrap() = 0;
-
-        // 追加一行新内容：文档 60 → 61 行。
+        // 模拟晚到的流式增量重排了视口上方（scrollback 固化区）的行：
+        // line 10 内容变化 → first_changed = 10 < viewport_top(52)。
         content.set_text(
             &(0..60)
-                .map(|i| format!("line {i}"))
-                .chain(std::iter::once("new tail".to_string()))
+                .map(|i| {
+                    if i == 10 {
+                        "line 10 (re-wrapped)".to_string()
+                    } else {
+                        format!("line {i}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
         tui.do_render(false);
 
         let frame = output.lock().unwrap().clone();
-        // 自愈路径：全量重发正文（而非 52 个字面 \r\n 的洪水滚动）。
+        // 清屏 + 全量重建（而非增量尾部重写）。
+        assert!(
+            frame.contains("\x1b[2J"),
+            "must clear before rebuilding: {frame:?}"
+        );
         assert!(frame.contains("line 0"));
-        assert!(frame.contains("new tail"));
-        assert!(!frame.contains(&"\r\n".repeat(8)));
-        // 自愈后视口跟踪重新同步到文档底部。
-        assert_eq!(*tui.main_viewport_top.lock().unwrap(), 61 - 8);
+        assert!(frame.contains("line 10 (re-wrapped)"));
+        // 重建后视口跟踪重置到文档尾部。
+        assert_eq!(*tui.main_viewport_top.lock().unwrap(), 60 - 8);
         tui.stop(Default::default());
     }
 
@@ -1875,10 +1840,7 @@ mod tests {
 
         // 第二行仍是 40 列空白，只是尾巴从“reset+OSC8”变成纯空：两边都是
         // 中性空白 → 剪枝，不产生“跳列 + 无文本”帧字节。
-        *lines.lock().unwrap() = vec![
-            "hello".to_string(),
-            " ".repeat(40),
-        ];
+        *lines.lock().unwrap() = vec!["hello".to_string(), " ".repeat(40)];
         tui.do_render(false);
 
         let frame = output.lock().unwrap().clone();
@@ -1958,10 +1920,7 @@ mod tests {
         content.set_text(
             &(0..60)
                 .map(|i| format!("line {i}"))
-                .chain([
-                    "new tail".to_string(),
-                    "another line".to_string(),
-                ])
+                .chain(["new tail".to_string(), "another line".to_string()])
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -1969,8 +1928,14 @@ mod tests {
 
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("another line"), "{frame:?}");
-        assert!(!frame.contains("\x1b[1A"), "cursor must not reposition: {frame:?}");
-        assert!(!frame.contains("\x1b[1B"), "cursor must not reposition: {frame:?}");
+        assert!(
+            !frame.contains("\x1b[1A"),
+            "cursor must not reposition: {frame:?}"
+        );
+        assert!(
+            !frame.contains("\x1b[1B"),
+            "cursor must not reposition: {frame:?}"
+        );
         assert!(!frame.contains("\x1b[2J"), "{frame:?}");
         tui.stop(Default::default());
     }

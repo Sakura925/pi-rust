@@ -14,7 +14,7 @@ is a template with placeholders.
 | `cargo binstall rpi-cli` | [`crates/rpi-cli/Cargo.toml`](../crates/rpi-cli/Cargo.toml) | **configured** | none — takes effect with the next published crate version |
 | Homebrew | [`bigfish1913/homebrew-tap`](https://github.com/bigfish1913/homebrew-tap) | **live** | none — `brew tap bigfish1913/tap && brew install rpi` |
 | Scoop | [`bigfish1913/scoop-bucket`](https://github.com/bigfish1913/scoop-bucket) | **live** | none — `scoop bucket add bigfish1913 <bucket url>` |
-| winget | [open at `microsoft/winget-pkgs#441442`](https://github.com/microsoft/winget-pkgs/pull/441442) | **submitted** | review by the winget team; `winget install bigfish1913.rpi` does not work until it merges |
+| winget | [0.4.0 PR #453448](https://github.com/microsoft/winget-pkgs/pull/453448) | **submitted** | Microsoft review is pending; this submission does not mean 0.4.0 is available through winget yet |
 
 The files in this directory are the source of truth for the two taps; the tap
 repos are copies. Homebrew-in-`homebrew-core` and `winget` carry the real
@@ -22,6 +22,14 @@ discovery weight — both index by name inside a package manager the user alread
 has open, which is traffic the website cannot reach.
 
 ## Cutting a release
+
+Normal releases are prepared by `release-plz` after ordinary PRs merge. Merge the
+bot's Release PR to publish crates, binaries, Homebrew, Scoop and the Microsoft
+winget submission automatically. CI records the generated manifests as an
+artifact; checked-in manifests are the baseline. See the setup and retry details
+in [`docs/maintaining/releasing.md`](../docs/maintaining/releasing.md).
+
+For manual releases/recovery, the local entry point remains:
 
 The whole pipeline — bump, tag, wait for the release binaries, refresh every
 manifest below, push the taps, open the winget PR, publish to crates.io, deploy
@@ -43,12 +51,12 @@ The table below records the original four targets. The workflow also builds
 Intel macOS as `rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching
 `.sha256`; this asset is available in releases whose tag includes that target.
 
-| Target | Asset | sha256 (v0.3.23) |
+| Target | Asset | sha256 (v0.4.1) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.3.23-x86_64-unknown-linux-gnu.tar.gz` | `44c4137cadf9c2e3fcd5f3affbc590029574d648b00f07e299d4324834296575` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.3.23-aarch64-unknown-linux-gnu.tar.gz` | `4c10967d91c46d2bb8d3de81f5d37288e3a1099a66e1dafec8c24a00be4c6e57` |
-| `aarch64-apple-darwin` | `rpi-v0.3.23-aarch64-apple-darwin.tar.gz` | `e64cbd4fe5bfde6450b87fee96f8018dc7eada786cce2a6e66408860cf826523` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.3.23-x86_64-pc-windows-msvc.zip` | `5d2a454652793f0489cbc52b45014f7598e7918dc20f72c53677e7a67b781605` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.4.1-x86_64-unknown-linux-gnu.tar.gz` | `253aa132946dc3631027421a5b6b1892b77db31d23e21e04ae43b334478b2fc1` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.4.1-aarch64-unknown-linux-gnu.tar.gz` | `8e0a6941c00afeb9eeff7b316cbade26e9c9ecdf27979bf769264aaef5f7c328` |
+| `aarch64-apple-darwin` | `rpi-v0.4.1-aarch64-apple-darwin.tar.gz` | `e7972f5f963607152468ff6593c343ae129204c9368a377dff1f86b6f99cf1e4` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.4.1-x86_64-pc-windows-msvc.zip` | `087eb883f5624aae85adb5d2347c45cadba45d640a0765abe93fae00505297e9` |
 
 Two consequences worth knowing:
 
@@ -65,7 +73,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.3.23                      # the tag being packaged
+TAG=v0.4.1                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

@@ -11,6 +11,122 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/bigfish1913/pi-rust/compare/v0.4.1...v0.5.0) - 2026-10-17
+
+### Added
+
+- *(extensions)* add plugin-owned child agent lifecycle
+- add provider login flows
+- *(extensions)* add streaming and cancellable plugin providers
+
+### Fixed
+
+- *(interactive_tui)* avoid deadlock in provider login key handling
+- *(cli)* switch session providers live and route models by API
+- *(auth)* unify package credential resolution and provider isolation
+- *(cli)* include provider packages in provider commands
+- *(extensions)* correct streaming provider cancellation and compatibility
+- harden provider callbacks and model identity
+
+### Other
+
+- *(changelog)* add 0.4.0 and 0.4.1 release notes
+- merge feature-stream-porider into feature-0.4.2
+- *(providers)* use the unified external provider package
+- *(providers)* move DeepSeek policy out of core
+- *(providers)* define provider integration and acceptance contract
+- *(providers)* unify factories and isolate execution bindings
+- *(extensions)* add DeepSeek streaming provider smoke example
+- *(providers)* extract optional native provider packages
+
+### Added
+
+- Expose safe live execution metadata and plugin-owned child-agent lifecycle
+  actions. Children use independent ephemeral sessions while inheriting the
+  current model/provider binding, project tools and approval UI; credentials
+  stay inside the host. Bound concurrency, output, turns, timeout and cleanup,
+  and cancel children when their parent run/session or owning plugin ends.
+
+- Stream custom plugin providers. A plugin registered with
+  `register_streaming_provider` emits per-chunk envelopes on a host callback and
+  the host maps them onto `AssistantMessageEvent`s as they arrive, so a plugin
+  provider renders progressively instead of appearing all at once when the
+  response is complete.
+- Cancel a plugin provider mid-generation. The streaming request fn now also
+  receives a `ProviderStreamControl` (plus a deferred completion signal reserved
+  for a future host). Polling it is the plugin's choice — one registration and one
+  signature cover both the fire-and-forget and the cooperative shape. A cancelled
+  run stops forwarding content and ends on `Error { reason: Aborted }` immediately,
+  and a cooperative plugin stops producing instead of streaming a generation
+  nobody will read.
+
+### Fixed
+
+- Bind child-agent actions to live tool invocations rather than a cached root
+  host: reject alias recursion and capability expansion, make expired/reverted
+  reload handles safe, and retain blocking tool drivers' owned parameters,
+  libraries and cleanup capacity until their final callback returns.
+- Keep cancelled parent invocations authorized for child cleanup only; propagate
+  invocation cancellation through queued starts and stream tool partials live.
+  Break the harness/provider/plugin ownership cycle with weak runtime bindings.
+  Back off pending tool polls, stop cancellation busy loops and reject late
+  success. Track provider and approval drivers against child cleanup capacity,
+  and retain provider/lifecycle DLLs inside the foreign callbacks themselves.
+- Report an aborted plugin provider as `ErrorReason::Aborted` rather than
+  `ErrorReason::Error`, so a user-cancelled run is no longer indistinguishable
+  from a provider failure.
+
+## [0.4.1] - 2026-10-17
+
+### Changed
+
+- Allow `rpi install` to upgrade an installed extension without `--force` and
+  skip an already-installed version. Require `--force` only to reinstall the
+  same version or downgrade, consistently across prebuilt, source and local
+  installs; apply the same version policy to `rpi package update`.
+- Synchronize the 0.4.0 installation channels and website release metadata.
+
+### Fixed
+
+- Rebuild terminal scrollback when wrapped row counts change, preventing stale
+  rows from remaining after content updates or terminal resizing.
+- Track the effective ANSI style state across wrapped lines instead of replaying
+  the entire style history, preventing escape-sequence growth in long styled
+  output while preserving colors and partial resets.
+
+## [0.4.0] - 2026-10-16
+
+### Added
+
+- Configure per-model USD cost rates, long-context pricing tiers and thinking-level
+  mappings in `models.json`; preserve those values when saving the configuration.
+- Prepare unified workspace Release PRs automatically after main CI succeeds.
+  Merging a Release PR publishes crates, five platform binaries, Homebrew/Scoop
+  and a retry-safe Microsoft winget submission.
+
+### Changed
+
+- Add `Model.cost_configured` (`costConfigured` in JSON) to distinguish unknown
+  prices from explicitly free models. `ModelDefinition` also adds `cost` and
+  `thinking_level_map`. Rust callers using exhaustive struct literals must supply
+  the new fields; `Model::new` provides its default. These API changes require the
+  0.4.0 release; the native extension SDK ABI remains unchanged.
+- Expose pricing availability in extension provider hooks and calculate request
+  costs using the configured model rates, including long-context tiers.
+
+### Fixed
+
+- Wait for buffered file appends to complete before returning, so immediate
+  reads and metadata queries always observe the appended bytes.
+- Release extension dialog state locks before submit callbacks, preventing
+  free-form answers and editor submissions from deadlocking the TUI.
+- Restore enhanced keyboard input on compatible macOS terminals so Shift+Enter
+  inserts a newline. Otty retains legacy input for CJK IME compatibility, with
+  `RPI_KITTY_KEYBOARD` available as an explicit override.
+- Wrap long Markdown code lines instead of clipping their tails with an ellipsis.
+- Keep different versions in separate publish queues and synchronize embedded
+  release notes before the Release PR becomes ready.
+
 ## [0.3.24] - 2026-10-15
 
 ### Added

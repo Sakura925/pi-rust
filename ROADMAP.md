@@ -88,12 +88,24 @@ global plugins.
 Still unmeasured and worth adding: tool-loop throughput, memory growth over a
 long session, compaction cost, and interactive TUI frame cost.
 
+## Provider packages
+
+Provider boundary cleanup keeps Anthropic and OpenAI in core. DeepSeek,
+OpenRouter, llama.cpp and Proxy share one optional rpi-providers package in the
+independent rpi-package project, with one install and upgrade entry point.
+See [Provider packages](docs/architecture/provider-packages.md) for installation,
+catalog registration, credential isolation and migration details.
+
 ## Later
 
-- **Sandboxing.** Plugin code and `bash` currently run with the user's full
-  privileges by design. A documented sandbox profile (seccomp/AppContainer or
-  a container runner) would make the agent safer to point at untrusted
-  repositories. This is a design problem, not a patch.
+- **Provider boundary cleanup and external adapters.** Keep the core runtime limited to the
+  Anthropic Messages and OpenAI-compatible (Chat Completions/Responses) protocols.
+  Move provider-specific integrations such as DeepSeek, OpenRouter, llama.cpp and
+  other specialized formats out of the core provider set and let them be supplied
+  by extensions or separate adapters. First introduce a provider registry/factory
+  boundary, preserve `models.json` compatibility for the two core protocol families,
+  and only then remove or feature-gate the extra built-in implementations. This is
+  future work; the current release keeps the existing providers unchanged.
 - **Multi-agent orchestration in-tree.** Sub-agents exist as an out-of-tree
   extension. The question is whether the runtime should own delegation,
   hand-off and budget accounting.

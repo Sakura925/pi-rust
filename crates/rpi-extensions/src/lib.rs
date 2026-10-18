@@ -62,8 +62,9 @@ use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
     BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn, ProviderRequestFn,
-    RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
+    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
+    ToolPollFn,
 };
 use thiserror::Error;
 
@@ -86,14 +87,14 @@ pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
     assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider, RegisteredProvider,
-    RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut, RegistryEntry,
-    RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
+    ExtensionTool, ProviderManifest, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
+    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut,
+    RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
 mod panel;
-pub use panel::{ExtensionPanel, PanelAnchor, PanelLayout};
+pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
     dispatch_data_event, dispatch_data_event_claiming, dispatch_empty_event,
@@ -248,10 +249,9 @@ impl HostApi {
     /// thread-local `CURRENT_HOST_API` (set for the duration of register in
     /// `load_one`) — they ignore `user_data`. Post-register `runtime_action`
     /// cannot use the thread-local (plugin calls from foreign threads), so when
-    /// a bridge is present `user_data` is repurposed to point at the
-    /// `ActionBridge` (the SDK-designated "host's opaque context"). The bridge's
-    /// scoped `Arc` is retained by the loaded plugin and session keepalive, so
-    /// the pointer a plugin stores during register stays valid.
+    /// a bridge is present `user_data` carries an opaque registry handle, never
+    /// its address. Dispatch upgrades a weak reference before accessing host
+    /// state, so an expired candidate reload fails without dereferencing it.
     pub fn build_vtable(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
         // When a bridge is present, user_data carries it (post-register action
         // recovery). Otherwise keep the register-path HostApi pointer (harmless
@@ -263,7 +263,7 @@ impl HostApi {
         let (runtime_action_fn, ud) = match &self.action_bridge {
             Some(bridge) => (
                 trampoline_runtime_action as RuntimeActionFn,
-                Arc::as_ptr(bridge) as *mut c_void,
+                bridge.user_data(),
             ),
             None => (
                 stub_runtime_action as RuntimeActionFn,
@@ -279,6 +279,7 @@ impl HostApi {
             register_shortcut: Some(trampoline_register_shortcut),
             register_flag: Some(trampoline_register_flag),
             register_provider: Some(trampoline_register_provider), // B5c
+            register_streaming_provider: Some(trampoline_register_streaming_provider), // B5c-s
             register_message_renderer: Some(trampoline_register_message_renderer), // B5c
             register_markdown_transformer: Some(trampoline_register_markdown_transformer), // B5c
             register_entry_renderer: Some(trampoline_register_entry_renderer), // B5c
@@ -392,18 +393,21 @@ extern "C" fn trampoline_register_tool(
         cancel_fn,
         destroy_fn,
         plugin_free_string,
+        runtime_handle: None,
     };
     // `register_tool` returns `bool` (true on overwrite of a prior same-named
     // tool). For the plugin a name collision is not a hard failure — always
     // return 0 (success) when the registry accepted it; -1 only if the registry
     // was already detached.
-    let ok =
-        with_current_api(
-            |api| match api.with_registry(|reg| reg.register_tool(tool, handle)) {
-                Some(_) => true,
-                None => false,
-            },
-        );
+    let ok = with_current_api(|api| {
+        let mut handle = handle;
+        handle.runtime_handle = api
+            .action_bridge
+            .as_ref()
+            .map(|bridge| bridge.user_data() as usize);
+        api.with_registry(|reg| reg.register_tool(tool, handle))
+            .is_some()
+    });
     if ok == Some(true) {
         0
     } else {
@@ -577,6 +581,9 @@ extern "C" fn trampoline_register_provider(
         base_url: unsafe { base_url.as_str().to_string() },
         api_style: unsafe { api_style.as_str().to_string() },
         request_fn,
+        // One-shot registration: no streaming fn. A plugin that also calls
+        // `register_streaming_provider` upgrades this record in place.
+        stream_fn: None,
         plugin_free_string,
         user_data,
     };
@@ -591,6 +598,64 @@ extern "C" fn trampoline_register_provider(
     } else {
         -1
     }
+}
+
+/// B5c-s: `register_streaming_provider` trampoline. Identical bookkeeping to
+/// [`trampoline_register_provider`], but records the plugin's
+/// [`ProviderStreamRequestFn`] as the record's `stream_fn` — the host then drives
+/// the per-chunk callback path (with the cancellation control surface) instead of
+/// the one-shot `request_fn`.
+///
+/// Upgrading an id that a plugin already registered one-shot **replaces** the
+/// record in place (see `ExtensionRegistry::register_streaming_provider`), so a
+/// plugin that registers both ends up on the streaming path.
+extern "C" fn trampoline_register_streaming_provider(
+    provider_id: StbStringRef,
+    base_url: StbStringRef,
+    api_style: StbStringRef,
+    request_fn: ProviderStreamRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // The one-shot slot stays non-null (a placeholder that fails loudly) so the
+    // record is uniform: the host prefers `stream_fn` whenever it is present.
+    let record = crate::registry::RegisteredProvider {
+        provider_id: unsafe { provider_id.as_str().to_string() },
+        base_url: unsafe { base_url.as_str().to_string() },
+        api_style: unsafe { api_style.as_str().to_string() },
+        request_fn: unsupported_one_shot_provider_request,
+        stream_fn: Some(request_fn),
+        plugin_free_string,
+        user_data,
+    };
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| reg.register_streaming_provider(record))
+            .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Placeholder `request_fn` for a streaming-only registration. The host never
+/// calls it (`RegisteredProvider::stream_fn.is_some()` routes to the streaming
+/// driver), so this exists purely to keep the record's one-shot field non-null
+/// and to fail loudly with a diagnostic instead of a null deref if a future code
+/// path ever does call it.
+extern "C" fn unsupported_one_shot_provider_request(
+    _req_json: StbStringRef,
+    _out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    tracing::error!(
+        "a streaming-only plugin provider was driven through the one-shot request path"
+    );
+    1
 }
 
 /// Register an OAuth provider manifest and action callback. The manifest is

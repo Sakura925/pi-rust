@@ -261,7 +261,7 @@ struct CommandContext {
     editor: Arc<Editor>,
     editor_container: Arc<Container>,
     lane: Arc<dyn AgentLane>,
-    model_catalog: Arc<Vec<rpi_ai::Model>>,
+    model_catalog: Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
     cwd: std::path::PathBuf,
     /// Loaded resources for /context; refreshed after successful /reload.
     resources: Arc<Mutex<rpi_harness::types::AgentHarnessResources>>,
@@ -381,8 +381,7 @@ impl CommandRegistry {
 fn dispatch_ui_prompt_event(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    let Some((snapshot, keepalive)) =
-        session_snapshot_bounded(state, EventTag::UiPromptStart)
+    let Some((snapshot, keepalive)) = session_snapshot_bounded(state, EventTag::UiPromptStart)
     else {
         return;
     };
@@ -397,9 +396,7 @@ fn dispatch_ui_prompt_event(state: &TuiState) {
 fn dispatch_ui_prompt_event_end(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
 
-    let Some((snapshot, keepalive)) =
-        session_snapshot_bounded(state, EventTag::UiPromptEnd)
-    else {
+    let Some((snapshot, keepalive)) = session_snapshot_bounded(state, EventTag::UiPromptEnd) else {
         return;
     };
     bounded_handler_call(UI_EVENT_DISPATCH_BUDGET, move || {
@@ -411,13 +408,13 @@ fn dispatch_ui_prompt_event_end(state: &TuiState) {
 /// Upper bound a UI-thread extension fan-out may block the key thread. Prompt
 /// events fire on every selector/dialog open+close (ask_user included); the
 /// budget trades a worst-case visible hiccup for never wedging input forever.
-pub(crate) const UI_EVENT_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const UI_EVENT_DISPATCH_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// Upper bound an extension key-claim may block the key thread before the key
 /// degrades to its normal editor routing. Tighter than the prompt budget:
 /// this sits on every keystroke while an extension subscribes to `Input`.
-const INPUT_CLAIM_DISPATCH_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(150);
+const INPUT_CLAIM_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Snapshot the extension registry with the session lock held only for the
 /// `Arc` clone, skipping the dispatch entirely when no handler subscribes to
@@ -472,7 +469,9 @@ const KEY_THREAD_HANG_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// deliberately independent of the key thread, the main loop and the render
 /// thread, so a hang in any of those cannot silence it.
 fn check_key_thread_heartbeat(state: &Arc<TuiState>) {
-    let beat = state.key_heartbeat_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let beat = state
+        .key_heartbeat_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
     if beat == 0 {
         return; // key loop not started yet
     }
@@ -504,7 +503,10 @@ fn check_key_thread_heartbeat(state: &Arc<TuiState>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, report.as_bytes()));
     tracing::error!(
         "key thread stalled for {elapsed_ms}ms — diagnostics written to {}",
@@ -513,15 +515,16 @@ fn check_key_thread_heartbeat(state: &Arc<TuiState>) {
 }
 
 fn key_heartbeat_now(state: &Arc<TuiState>) -> u64 {
-    state
-        .tui_start_instant
-        .elapsed()
-        .as_millis() as u64
+    state.tui_start_instant.elapsed().as_millis() as u64
 }
 
 fn key_hang_report_path() -> std::path::PathBuf {
     let root = std::env::var_os("RPI_CODING_AGENT_DIR")
-        .and_then(|agent| std::path::PathBuf::from(agent).parent().map(|p| p.to_path_buf()))
+        .and_then(|agent| {
+            std::path::PathBuf::from(agent)
+                .parent()
+                .map(|p| p.to_path_buf())
+        })
         .or_else(|| dirs::home_dir().map(|h| h.join(".rpi")))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     root.join("logs").join("key-thread-hang.txt")
@@ -558,29 +561,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = era * 400 + yoe as i64 + if m <= 2 { 1 } else { 0 };
     (y, m, d)
-}
-
-/// Route a key to the active extension dialog widget (editor first, then
-/// input).
-///
-/// The widgets are cloned OUT of their slot mutexes BEFORE `handle_key` is
-/// called: the dialog widgets' submit/cancel callbacks re-enter those same
-/// mutexes (via `close_extension_editor`), and a guard held across the call —
-/// which is exactly what an inline `if let state.lock()...` does in Edition
-/// 2021, the temporary living to the end of the whole if/else — self-
-/// deadlocks the key thread. The fourth hang froze exactly here, and the
-/// `try_lock` fallback in `close_extension_editor` only degraded that
-/// deadlock into a leaked stale dialog. Releasing before the call keeps the
-/// re-entry a plain, correct lock acquisition. Extracted so the contract is
-/// unit-testable.
-fn route_extension_dialog_key(state: &Arc<TuiState>, key: KeyEvent) {
-    let active_editor = state.active_extension_editor.lock().unwrap().clone();
-    let active_input = state.active_extension_input.lock().unwrap().clone();
-    if let Some(extension_editor) = active_editor {
-        extension_editor.handle_key(key);
-    } else if let Some(extension_input) = active_input {
-        extension_input.handle_key(key);
-    }
 }
 
 /// Canonical key name for a key event, matching the vocabulary
@@ -705,11 +685,7 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
         let payload = payload.clone();
         move || {
             let _keepalive = keepalive;
-            rpi_extensions::dispatch_data_event_claiming(
-                &snapshot,
-                EventTag::Input,
-                &payload,
-            )
+            rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload)
         }
     })
     .unwrap_or(false);
@@ -869,10 +845,19 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
 // Channel + helpers
 // ===========================================================================
 
+#[derive(Clone, Copy, Debug)]
+enum ProviderOAuthPurpose {
+    Login,
+    Logout,
+}
+
 /// Message type for communication between the key/callback threads and the
 /// main async loop.
 enum TuiMessage {
     UserInput(String, Vec<rpi_ai::types::ImageContent>),
+    /// Provider changes are serialized with prompts, after the current run.
+    SwitchProvider(String),
+    OpenProviderSelector,
     OpenTree,
     NavigateTree(String),
     Exit,
@@ -906,7 +891,27 @@ enum TuiMessage {
     /// mailbox) signal the main loop, which awaits
     /// `reload_extension_resources` on the async runtime.
     ReloadExtensions,
-    /// Result returned after Ctrl+G edits a temporary file in an external
+    /// Request an OAuth action. The action itself runs off the main loop because
+    /// provider callbacks are synchronous FFI calls and may wait for user
+    /// interaction (for example, a browser/device-code exchange).
+    ProviderOAuthAction {
+        provider: String,
+        action: String,
+        input: serde_json::Value,
+        purpose: ProviderOAuthPurpose,
+        flow_id: u64,
+    },
+    /// Result of one provider-owned OAuth action.
+    ProviderOAuthResult {
+        provider: String,
+        action: String,
+        result: Result<serde_json::Value, String>,
+        purpose: ProviderOAuthPurpose,
+        flow_id: u64,
+    },
+    /// Request provider-aware logout. OAuth credentials are revoked before the
+    /// local auth entry is removed; API-key credentials are removed directly.
+    LogoutProvider(String),
     /// editor. Handling it on the async loop keeps editor mutation single-
     /// threaded with the rest of the TUI state.
     ExternalEditorResult(Result<String, String>),
@@ -1416,6 +1421,8 @@ pub async fn interactive_tui(
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1445,9 +1452,9 @@ pub async fn interactive_tui(
         pending_container: Arc::new(Container::new()),
         dequeue_hint: pending_dequeue_hint(&keybindings),
         key_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
-            tui_start_instant: std::time::Instant::now(),
-            key_hang_reported: std::sync::atomic::AtomicBool::new(false),
-            dialog_generation: std::sync::atomic::AtomicU64::new(0),
+        tui_start_instant: std::time::Instant::now(),
+        key_hang_reported: std::sync::atomic::AtomicBool::new(false),
+        dialog_generation: std::sync::atomic::AtomicU64::new(0),
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
@@ -1487,7 +1494,7 @@ pub async fn interactive_tui(
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
-    let model_catalog_arc = Arc::new(model_catalog.clone());
+    let model_catalog_arc = reload_context.catalog.clone();
 
     // ---- Layout root (built ONCE; mirrors TS fullscreenLayoutRoot) ----
     // root = VStack[ scrollview(basis:0 grow:1 shrink:1 min:1), dock(shrink:1) ]
@@ -1885,10 +1892,7 @@ pub async fn interactive_tui(
             // Heartbeat: the render-tick watchdog checks this every tick; a
             // wedged lock below stalls it and triggers a diagnostic dump.
             state_for_key.key_heartbeat_ms.store(
-                state_for_key
-                    .tui_start_instant
-                    .elapsed()
-                    .as_millis() as u64,
+                state_for_key.tui_start_instant.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
             if !*running_key.lock().unwrap() {
@@ -2049,6 +2053,20 @@ pub async fn interactive_tui(
                             continue;
                         }
                     }
+                    if let Some(input) = state_for_key.active_provider_input.lock().unwrap().clone()
+                    {
+                        input.handle_paste(&text);
+                        tui_for_key.request_render_reusing_scroll_content();
+                        continue;
+                    }
+                    if state_for_key
+                        .provider_auth_flow_id
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                    {
+                        tui_for_key.request_render_reusing_scroll_content();
+                        continue;
+                    }
                     if let Some(images) = images_from_pasted_paths(&text) {
                         for image in images {
                             state_for_key.queue_image(image);
@@ -2151,6 +2169,34 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // Provider login inputs use the same input slot without creating an
+            // Add-provider form state. Route them before the normal editor so
+            // masked API keys and OAuth exchange values actually receive keys.
+            if handle_provider_login_key(&state_for_key, key) {
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // OAuth begin/exchange/revoke owns the input slot even while the
+            // provider call is running. Do not let keys leak into the prompt.
+            if state_for_key
+                .provider_auth_flow_id
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+                    finish_provider_login(
+                        &state_for_key,
+                        &ctx_for_key.editor_container,
+                        &editor_for_key,
+                        &tui_for_key,
+                    );
+                    add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
+                }
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
             // Extension dialogs own the input slot while awaiting a result.
             // Esc and Ctrl+C both resolve the pending command with cancel;
             // all other keys go to the active native editor/input widget.
@@ -2167,7 +2213,7 @@ pub async fn interactive_tui(
                         );
                     }
                 } else {
-                    route_extension_dialog_key(&state_for_key, key);
+                    handle_extension_dialog_key(&state_for_key, key);
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
@@ -2185,8 +2231,7 @@ pub async fn interactive_tui(
                 // freeze input (see `ExtensionCommand::execute`).
                 let session_for_quiet = state_for_key.extension_session.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ =
-                        invoke_extension_command(&session_for_quiet, "pet", "quiet");
+                    let _ = invoke_extension_command(&session_for_quiet, "pet", "quiet");
                 });
                 tui_for_key.request_render(false);
                 if *state_for_key.status.lock().unwrap() == RunStatus::Idle
@@ -2452,7 +2497,13 @@ pub async fn interactive_tui(
                 // Cycle within the `/scoped-models` set (settings.json) when
                 // configured; otherwise the full catalog, restricted to the
                 // current provider (the lane cannot route another provider).
-                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = scoped_catalog(
+                    &ctx_for_key
+                        .model_catalog
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &current,
+                );
                 let scope = same_provider_catalog(&scope, &current);
                 if let Some(next) = cycle_next_model(&scope, &current) {
                     state_for_key.set_current_model(&next);
@@ -2473,7 +2524,13 @@ pub async fn interactive_tui(
                 rpi_tui::keybindings::keys::MODEL_CYCLE_BACKWARD,
             ) {
                 let current = state_for_key.current_model_id();
-                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = scoped_catalog(
+                    &ctx_for_key
+                        .model_catalog
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &current,
+                );
                 let scope = same_provider_catalog(&scope, &current);
                 if let Some(prev) = cycle_prev_model(&scope, &current) {
                     state_for_key.set_current_model(&prev);
@@ -2494,7 +2551,10 @@ pub async fn interactive_tui(
                 rpi_tui::keybindings::keys::THINKING_CYCLE,
             ) {
                 let lane = lane_for_key.clone();
-                let catalog = model_catalog_for_key.clone();
+                let catalog = model_catalog_for_key
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
                 let state = state_for_key.clone();
                 tokio::spawn(async move {
                     let Ok(current_model) = lane.get_model().await else {
@@ -2950,6 +3010,34 @@ pub async fn interactive_tui(
             break;
         }
         match rx.recv().await {
+            Some(TuiMessage::OpenProviderSelector) => {
+                let current = lane.get_model().await.ok();
+                open_provider_selector(
+                    &state,
+                    &editor_container,
+                    &editor,
+                    &tui,
+                    &ctx.reload_context.extension_session,
+                    &ctx.tx,
+                    current.as_ref().map(|model| model.provider.as_str()),
+                );
+            }
+            Some(TuiMessage::SwitchProvider(input)) => {
+                let manifests = current_provider_manifests(&ctx.reload_context.extension_session);
+                let available = ctx
+                    .model_catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                match switch_provider(&input, &manifests, &available, &lane).await {
+                    Ok((model, note)) => {
+                        state.set_current_model(&model);
+                        add_note_message(&chat_container, &note);
+                    }
+                    Err(error) => add_error_message(&chat_container, &error),
+                }
+                tui.request_render(false);
+            }
             Some(TuiMessage::UserInput(prompt, prompt_images)) => {
                 // Clear the editor so the next prompt starts fresh (the submit
                 // handler runs on the blocking key thread and can't mutate the
@@ -2975,7 +3063,10 @@ pub async fn interactive_tui(
                 let outgoing_prompt = if image_paths.is_empty() {
                     prompt.clone()
                 } else {
-                    format!("{prompt}\n\n[attached image(s) saved to: {}]", image_paths.join(", "))
+                    format!(
+                        "{prompt}\n\n[attached image(s) saved to: {}]",
+                        image_paths.join(", ")
+                    )
                 };
                 run_prompt_streaming(
                     &lane,
@@ -3234,6 +3325,151 @@ pub async fn interactive_tui(
                 )
                 .await;
                 tui.request_render(false);
+            }
+            Some(TuiMessage::ProviderOAuthAction {
+                provider,
+                action,
+                input,
+                purpose,
+                flow_id,
+            }) => {
+                let (snapshot, keepalive) = {
+                    let session = ctx
+                        .reload_context
+                        .extension_session
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    (session.snapshot_arc(), session.keepalive())
+                };
+                let tx = ctx.tx.clone();
+                let provider_result = provider.clone();
+                let action_result = action.clone();
+                tokio::spawn(async move {
+                    let result = match snapshot {
+                        Some(snapshot) => {
+                            let provider_call = provider.clone();
+                            let action_call = action.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _keepalive = keepalive;
+                                rpi_extensions::request_oauth(
+                                    &snapshot,
+                                    &provider_call,
+                                    &action_call,
+                                    input,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                            .await
+                            .map_err(|error| format!("OAuth worker failed: {error}"))
+                            .and_then(|result| result)
+                        }
+                        None => Err("no OAuth extensions are loaded".to_string()),
+                    };
+                    let _ = tx.send(TuiMessage::ProviderOAuthResult {
+                        provider: provider_result,
+                        action: action_result,
+                        result,
+                        purpose,
+                        flow_id,
+                    });
+                });
+            }
+            Some(TuiMessage::ProviderOAuthResult {
+                provider,
+                action,
+                result,
+                purpose,
+                flow_id,
+            }) => {
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
+                handle_provider_oauth_result(
+                    &state,
+                    &editor_container,
+                    &editor,
+                    &tui,
+                    &ctx.tx,
+                    &provider,
+                    &action,
+                    result,
+                    purpose,
+                    flow_id,
+                );
+            }
+            Some(TuiMessage::LogoutProvider(provider)) => {
+                let auth = match crate::config::read_auth() {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        add_error_message(
+                            &chat_container,
+                            &format!("Could not read saved credentials: {error}"),
+                        );
+                        tui.request_render(false);
+                        continue;
+                    }
+                };
+                let credential = auth.get(&provider).cloned();
+                match credential {
+                    Some(crate::config::Credential::Oauth {
+                        access, refresh, ..
+                    }) => {
+                        show_provider_auth_status(
+                            &state,
+                            &editor_container,
+                            &editor,
+                            &tui,
+                            &format!("Revoking OAuth credentials for {provider}…"),
+                        );
+                        let flow_id = state
+                            .provider_auth_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                            .wrapping_add(1);
+                        state
+                            .provider_auth_flow_id
+                            .store(flow_id, std::sync::atomic::Ordering::Release);
+                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
+                            provider,
+                            action: "revoke".to_string(),
+                            input: serde_json::json!({
+                                "credential": {"access": access, "refresh": refresh}
+                            }),
+                            purpose: ProviderOAuthPurpose::Logout,
+                            flow_id,
+                        });
+                    }
+                    Some(crate::config::Credential::ApiKey { .. }) => {
+                        match crate::config::delete_credential(&provider) {
+                            Ok(true) => {
+                                add_note_message(
+                                    &chat_container,
+                                    &format!("Removed saved credentials for {provider}; reloading providers…"),
+                                );
+                                let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
+                            }
+                            Ok(false) => add_note_message(
+                                &chat_container,
+                                &format!("No saved credentials found for {provider}."),
+                            ),
+                            Err(error) => add_error_message(
+                                &chat_container,
+                                &format!("Could not remove {provider} credentials: {error}"),
+                            ),
+                        }
+                        tui.request_render(false);
+                    }
+                    None => {
+                        add_note_message(
+                            &chat_container,
+                            &format!("No saved credentials found for {provider}."),
+                        );
+                        tui.request_render(false);
+                    }
+                }
             }
             Some(TuiMessage::ReloadExtensions) => {
                 // B5d: drive the shared reload routine on the async runtime,
