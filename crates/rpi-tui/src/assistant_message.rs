@@ -262,21 +262,55 @@ impl AssistantMessageComponent {
                             0,
                         )));
                     } else {
-                        // Render the joined thinking as one dim italic markdown
-                        // section — the TS `color: thinkingText, italic: true`
-                        // styling. The base style must be applied per rendered
-                        // line (not by wrapping the whole markdown source with
-                        // ANSI): the renderer's inner spans (inline code,
-                        // links, headings) emit `SGR 0` resets, which would
-                        // otherwise drop the enclosing italic/color from the
-                        // rest of the block.
+                        // Render the joined thinking as a dim markdown section
+                        // quoted with a │ rail — the structural distinction
+                        // from the answer text. It deliberately drops the
+                        // TS `italic: true` styling: real-italic fonts draw
+                        // Latin/digits with thinner strokes than CJK glyphs
+                        // (which have no italic form), so italic thinking
+                        // mottles mixed-script lines bright/dim within one
+                        // row. The base style must still be applied per
+                        // rendered line (not by wrapping the whole markdown
+                        // source with ANSI): the renderer's inner spans
+                        // (inline code, links, headings) emit `SGR 0` resets,
+                        // which would otherwise drop the enclosing color from
+                        // the rest of the block.
                         let body = joined.join("\n\n");
                         // B5e: transform the PLAIN thinking markdown first (the
                         // plugin must see markdown, not ANSI).
                         let transformed = self.transform_markdown(&body);
-                        let base_style = format!("\x1b[3m{}", theme().colors.thinking_text.to_fg());
+                        // Quote-wrap the thinking body so the markdown
+                        // renderer's blockquote path draws a left │ border on
+                        // every (wrapped) line — a structural distinction
+                        // from the answer text that does not rely on color
+                        // perception. Empty lines stay inside the quote (a
+                        // bare `>`) to keep the border continuous across the
+                        // block's paragraphs. The quote path colors the body
+                        // with `md_quote`, and `apply_base_style` re-opens
+                        // the thinking_text color base after nested SGR
+                        // resets (inline code / links), so the old
+                        // style-after-reset regression stays covered.
+                        let quoted: String = transformed
+                            .lines()
+                            .map(|l| {
+                                if l.trim().is_empty() {
+                                    ">".to_string()
+                                } else {
+                                    format!("> {l}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        // Color-only base style (no \x1b[3m italic): CJK glyphs have no
+                        // italic form while Latin/digits use real-italic thin
+                        // strokes, so an italic base mottles mixed-script
+                        // thinking lines bright/dim within one row. The quote
+                        // path re-opens this base after nested SGR resets;
+                        // brightness sits between the │ rail and the answer
+                        // text (fg ≈208) so the hierarchy stays obvious.
+                        let base_style = theme().colors.thinking_text.to_fg();
                         let md = Arc::new(
-                            Markdown::new(transformed, opts.output_pad, 0)
+                            Markdown::new(quoted, opts.output_pad, 0)
                                 .with_base_style(base_style),
                         );
                         self.content_container.add_child(md);
@@ -509,8 +543,10 @@ mod tests {
     fn test_thinking_style_survives_inline_code_reset() {
         // Regression: the thinking base style used to be applied by wrapping
         // the whole markdown source with ANSI. Inline code emits an `SGR 0`
-        // reset, which dropped the italic + thinking color for the rest of the
-        // block. The base style must be re-opened after that reset.
+        // reset, which dropped the thinking color for the rest of the
+        // block. The base style must be re-opened after that reset. (The
+        // base is color-only now — real-italic fonts draw Latin thinner
+        // than CJK, so italic thinking mottled mixed-script lines.)
         let msg = AssistantMessageComponent::default();
         msg.update_blocks(&[AssistantBlock::Thinking(
             "consider `render_inline` then keep thinking".to_string(),
@@ -526,8 +562,14 @@ mod tests {
             "text after inline code missing: {rendered:?}"
         );
         assert!(
-            after_code.contains("\x1b[3m") && after_code.contains(&fg),
-            "thinking italic/color lost after inline code: {rendered:?}"
+            after_code.contains(&fg),
+            "thinking color lost after inline code: {rendered:?}"
+        );
+        // The thinking base must not re-open the italic: the quote rail +
+        // color carry the distinction without glyph mottling.
+        assert!(
+            !after_code.contains("\x1b[3m"),
+            "italic re-opened on thinking base: {rendered:?}"
         );
     }
 

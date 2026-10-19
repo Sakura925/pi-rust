@@ -348,14 +348,27 @@ impl Markdown {
                     &prefix,
                     &self.render_inline(item.body),
                     cwidth,
+                    false,
                     &mut lines,
                 );
             } else if let Some((depth, body)) = parse_blockquote(line) {
                 list_continuation_indent = None;
                 let border = colors.md_quote_border.fg("│");
                 let prefix = format!("  {}", format!("{border} ").repeat(depth));
-                let body = colors.md_quote.fg(&italic(&self.render_inline(body)));
-                push_wrapped_with_prefix(&pad, &prefix, &body, cwidth, &mut lines);
+                // An empty quote line (a bare `>`) keeps the rail without any
+                // body. Sending an empty string through render_inline would
+                // leak its "x " inline-context placeholder into the output.
+                if body.trim().is_empty() {
+                    lines.push(format!("{pad}{prefix}"));
+                } else {
+                    // No italic on the quote body: real-italic fonts render
+                    // Latin/digits with thinner strokes than CJK (which has no
+                    // italic form), so an italic quote mottles mixed-script
+                    // lines bright/dim within one row. The │ rail alone marks
+                    // the quote; `md_quote` carries the dim color.
+                    let body = colors.md_quote.fg(&self.render_inline(body));
+                    push_wrapped_with_prefix(&pad, &prefix, &body, cwidth, true, &mut lines);
+                }
             } else if line.trim().starts_with("---") || line.trim().starts_with("***") {
                 list_continuation_indent = None;
                 // Horizontal rule (capped like the TS reference), mdHr colored.
@@ -376,6 +389,7 @@ impl Markdown {
                     &" ".repeat(indent),
                     &self.render_inline(line.trim()),
                     cwidth,
+                    false,
                     &mut lines,
                 );
             } else {
@@ -896,6 +910,7 @@ fn push_wrapped_with_prefix(
     prefix: &str,
     rendered: &str,
     cwidth: usize,
+    repeat_prefix: bool,
     out: &mut Vec<String>,
 ) {
     let prefix_width = visible_width(prefix);
@@ -905,9 +920,20 @@ fn push_wrapped_with_prefix(
         out.push(format!("{pad}{prefix}"));
         return;
     }
-    let continuation = " ".repeat(prefix_width);
+    // Blockquotes repeat their border on wrapped lines so the │ rail
+    // stays continuous down the whole block; lists keep their marker on
+    // the first line only and align continuations under the text.
+    let continuation = if repeat_prefix {
+        prefix.to_string()
+    } else {
+        " ".repeat(prefix_width)
+    };
     for (index, line) in wrapped.iter().enumerate() {
-        let line_prefix = if index == 0 { prefix } else { &continuation };
+        let line_prefix = if index == 0 {
+            prefix
+        } else {
+            continuation.as_str()
+        };
         // `wrap_text_with_ansi` preserves the separating space at a wrap
         // boundary. It is useful for paragraphs, but here it would make a
         // continuation one column farther right than the list's text.

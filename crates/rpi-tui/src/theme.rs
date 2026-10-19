@@ -642,12 +642,13 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.border_muted = Color::Rgb(71, 82, 88); // bg3 #475258
             colors.selection = Color::Rgb(61, 72, 77); // bg2 #3d484d
             colors.cursor = Color::Rgb(127, 187, 179);
-            // Lifted one step from grey1 (#859289, 3.84:1) to #8f9a92 for
-            // sustained-reading comfort (4.28:1) — user review found grey1
-            // slightly too dim. The hierarchy stays obvious: italic +
-            // mid-brightness grey-green against the much brighter default
-            // foreground (~208), brightness gap 58.
-            colors.thinking_text = Color::Rgb(143, 154, 146); // #8f9a92
+            // Lifted twice from grey1 (#859289, 3.84:1): grey1 → #8f9a92
+            // (4.28:1) → #97a49b (4.81:1). User review: first lift was still
+            // a touch dim for sustained reading. The hierarchy stays obvious
+            // without any italic (real-italic fonts draw Latin thinner than
+            // CJK): │ rail + mid-brightness grey-green against the much
+            // brighter default foreground (~208), brightness gap 49.
+            colors.thinking_text = Color::Rgb(151, 164, 155); // #97a49b
 
             // Markdown
             colors.md_heading = Color::Rgb(219, 188, 127); // yellow
@@ -658,7 +659,7 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.md_code_block = Color::Rgb(211, 198, 170); // #d3c6aa
             colors.md_code_block_bg = Color::Rgb(48, 58, 64);
             colors.md_code_block_border = Color::Rgb(122, 132, 120); // grey0 #7a8478
-            colors.md_quote = Color::Rgb(173, 182, 173); // muted
+            colors.md_quote = Color::Rgb(151, 164, 155); // #97a49b — quote path carries the thinking body color (matches thinking_text)
             colors.md_quote_border = Color::Rgb(122, 132, 120); // grey0
             colors.md_hr = Color::Rgb(122, 132, 120);
             colors.md_list_bullet = Color::Rgb(127, 187, 179); // accent
@@ -807,7 +808,9 @@ mod tests {
         assert!(matches!(theme.colors.custom_message_bg, Color::Rgb(74, 68, 78)));
         // Thinking sits one step above grey1: lifted to #8f9a92 for
         // continuous reading while staying clearly dimmer than the
-        // default foreground.
-        assert!(matches!(theme.colors.thinking_text, Color::Rgb(143, 154, 146)));
+        // default foreground. The quote path renders the thinking body
+        // with md_quote, which matches thinking_text here.
+        assert!(matches!(theme.colors.thinking_text, Color::Rgb(151, 164, 155)));
+        assert!(matches!(theme.colors.md_quote, Color::Rgb(151, 164, 155)));
     }
 }
