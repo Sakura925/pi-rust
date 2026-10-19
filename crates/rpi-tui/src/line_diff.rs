@@ -160,7 +160,14 @@ fn update_sgr_context(slots: &mut Vec<(SgrSlot, String)>, sequence: &str) {
                 };
                 let component_count = match values.get(index + 1).copied() {
                     Some("5") if values.get(index + 2).is_some() => 3,
-                    Some("2") if values.get(index + 5).is_some() => 6,
+                    // `38;2;R;G;B` is exactly five parameters: 38, 2, R, G, B.
+                    // The old check probed values[index + 5] (a sixth
+                    // parameter that never exists), so every truecolor
+                    // sequence fell through to the per-parameter path —
+                    // splitting `38;2;143;154;146` into `[38m [2m [143m
+                    // [154m [146m`, where the `2` landed in the Intensity
+                    // slot as DIM and dimmed every wrapped continuation row.
+                    Some("2") if values.get(index + 4).is_some() => 5,
                     _ => 0,
                 };
                 if component_count != 0 {
@@ -319,6 +326,37 @@ mod tests {
         let mut active_style = vec!["\x1b[31mred".to_string(), "tail".to_string()];
         isolate_wrapped_lines(&mut active_style);
         assert!(active_style[1].starts_with("\x1b[31mtail"));
+    }
+
+    #[test]
+    fn truecolor_context_is_replayed_as_one_sequence_not_split() {
+        // Regression: `38;2;R;G;B` is five parameters, but the old probe
+        // required a sixth (`values[index + 5]`), so every truecolor
+        // sequence fell through to the per-parameter path: the `2` landed in
+        // the Intensity slot as `\x1b[2m` (DIM) and dimmed all wrapped
+        // continuation rows.
+        let mut lines = vec![
+            "\x1b[38;2;143;154;146mfirst row text".to_string(),
+            "second row text".to_string(),
+        ];
+        isolate_wrapped_lines(&mut lines);
+        let continuation = lines[1].strip_prefix("\x1b[38;2;143;154;146m").expect(
+            "continuation must replay the truecolor sequence verbatim",
+        );
+        assert!(
+            continuation.starts_with("second row text"),
+            "unexpected continuation content: {continuation:?}"
+        );
+        assert!(
+            !lines[1].contains("\x1b[2m"),
+            "DIM leaked into the wrapped context: {:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[1].contains("\x1b[38m"),
+            "truecolor sequence was split per-parameter: {:?}",
+            lines[1]
+        );
     }
 
     #[test]
