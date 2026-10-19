@@ -460,6 +460,8 @@ pub(super) fn open_theme_selector(
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
         SelectItem::new("harbor", "Harbor")
             .with_description("Matched to the tty7 Harbor dark palette"),
+        SelectItem::new("nord", "Nord")
+            .with_description("Matched to the tty7 Nord dark palette"),
     ];
     let list = Arc::new(SelectList::new(items, 10));
 
@@ -474,6 +476,7 @@ pub(super) fn open_theme_selector(
             "monochrome" => Some(ThemePreset::Monochrome),
             "dark" => Some(ThemePreset::Dark),
             "harbor" => Some(ThemePreset::Harbor),
+            "nord" => Some(ThemePreset::Nord),
             name => {
                 add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
                 close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);

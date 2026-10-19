@@ -52,7 +52,7 @@ pub(super) enum SelectorKind {
     Images,
     /// `/session` — browse and switch saved JSONL sessions.
     Session,
-    /// `/theme` — dark / light / monochrome / harbor presets applied live.
+    /// `/theme` — dark / light / monochrome / harbor / nord presets applied live.
     Theme,
     /// `/provider` — switch the live provider and persist the successful choice.
     Provider,

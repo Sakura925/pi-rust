@@ -1173,6 +1173,7 @@ pub async fn interactive_tui(
         Some("monochrome") => Some(ThemePreset::Monochrome),
         Some("dark") => Some(ThemePreset::Dark),
         Some("harbor") => Some(ThemePreset::Harbor),
+        Some("nord") => Some(ThemePreset::Nord),
         _ => None,
     } {
         apply_theme_preset(preset);

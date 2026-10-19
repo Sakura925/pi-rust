@@ -551,6 +551,72 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
                 ..Default::default()
             }
         }
+        ThemePreset::Nord => {
+            // Nord: matched to the tty7 terminal's built-in "Nord" preset
+            // (background nord0 #2e3440, foreground nord4 #d8dee9, accent
+            // nord8 #88c0d0). Component layering follows the official Nord
+            // palette — surfaces are nord1 #3b4252, selection nord2 #434c5e,
+            // borders nord3 #4c566a / nord10 #5e81ac. Semantic colors
+            // approximate the Nord hexes by their nearest ANSI-256 index
+            // (accent #88c0d0 ≈ 110, green #a3be8c ≈ 144) so 256-color
+            // terminals keep the relationships; nord11 red, nord13 yellow,
+            // and the frost blues #81a1c1/#8fbcbb stay truecolor Rgb (their
+            // nearest 256 twins are either too dim on nord0 or collide with
+            // each other on index 109).
+            let mut colors = ThemeColors::default();
+            colors.text = Color::Default;
+            colors.muted = Color::Ansi256(247); // ≈ desaturated nord4 #98a2b3
+            colors.dim = Color::Ansi256(243);
+            colors.accent = Color::Ansi256(110); // ≈ nord8 #88c0d0
+            colors.error = Color::Rgb(191, 97, 106); // nord11 (256 twin too dim)
+            colors.success = Color::Ansi256(144); // ≈ nord14 #a3be8c
+            colors.warning = Color::Rgb(235, 203, 139); // nord13
+            colors.info = Color::Rgb(143, 188, 187); // nord7
+            colors.background = Color::Default;
+            colors.surface = Color::Rgb(59, 66, 82); // nord1 surface
+            colors.border = Color::Ansi256(67); // ≈ nord10 #5e81ac
+            colors.border_accent = Color::Rgb(136, 192, 208); // nord8
+            colors.border_muted = Color::Rgb(76, 86, 106); // nord3
+            colors.selection = Color::Rgb(67, 76, 94); // nord2
+            colors.cursor = Color::Rgb(136, 192, 208);
+            colors.thinking_text = Color::Ansi256(247);
+
+            // Markdown
+            colors.md_heading = Color::Rgb(235, 203, 139); // nord13
+            colors.md_link = Color::Rgb(129, 161, 193); // nord9
+            colors.md_link_url = Color::Ansi256(243);
+            colors.md_code = Color::Rgb(136, 192, 208); // nord8 (pi: code ≈ accent)
+            colors.md_code_bg = Color::Rgb(59, 66, 82); // nord1 chip
+            colors.md_code_block = Color::Rgb(216, 222, 233); // nord4 body
+            colors.md_code_block_bg = Color::Rgb(59, 66, 82); // nord1
+            colors.md_code_block_border = Color::Rgb(76, 86, 106); // nord3
+            colors.md_quote = Color::Ansi256(247);
+            colors.md_quote_border = Color::Rgb(76, 86, 106); // nord3
+            colors.md_hr = Color::Rgb(76, 86, 106);
+            colors.md_list_bullet = Color::Ansi256(110); // accent
+
+            // Tool blocks
+            colors.tool_pending_bg = Color::Rgb(59, 66, 82); // nord1
+            colors.tool_success_bg = Color::Rgb(69, 80, 79); // nord0 + 20% nord14
+            colors.tool_error_bg = Color::Rgb(78, 62, 73); // nord0 + 22% nord11
+            colors.tool_title = Color::Default;
+            colors.tool_output = Color::Ansi256(247);
+            colors.bash_mode = Color::Ansi256(144);
+
+            // Custom messages / skill invocation
+            colors.custom_message_bg = Color::Rgb(67, 66, 81); // nord0 + 16% nord15
+            colors.custom_message_label = Color::Rgb(180, 142, 173); // nord15
+            colors.custom_message_text = Color::Default;
+
+            // Tool diffs
+            colors.tool_diff_added = Color::Ansi256(144);
+            colors.tool_diff_removed = Color::Rgb(191, 97, 106); // nord11
+            colors.tool_diff_context = Color::Ansi256(247);
+            Theme {
+                colors,
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -569,6 +635,10 @@ pub enum ThemePreset {
     /// Harbor — matched to the tty7 terminal's built-in "Harbor" dark
     /// preset (background #1d2022, accent steel blue #6c96b4).
     Harbor,
+    /// Nord — matched to the tty7 terminal's built-in "Nord" preset
+    /// (background nord0 #2e3440, accent nord8 #88c0d0, official palette
+    /// layering: surfaces nord1, selection nord2, borders nord3/nord10).
+    Nord,
 }
 
 /// Global theme helper functions.
@@ -631,5 +701,22 @@ mod tests {
         // Harbor cyan has no faithful 256 twin and stays truecolor.
         assert!(matches!(theme.colors.info, Color::Rgb(87, 199, 195)));
         assert!(matches!(theme.colors.md_code, Color::Rgb(77, 153, 137)));
+    }
+
+    #[test]
+    fn test_nord_preset() {
+        let manager = ThemeManager::new();
+        manager.apply_preset(ThemePreset::Nord);
+        let theme = manager.get();
+        // Official Nord layering: nord1 surface, nord2 selection.
+        assert!(matches!(theme.colors.surface, Color::Rgb(59, 66, 82)));
+        assert!(matches!(theme.colors.selection, Color::Rgb(67, 76, 94)));
+        assert!(matches!(theme.colors.accent, Color::Ansi256(110)));
+        assert!(matches!(theme.colors.success, Color::Ansi256(144)));
+        // Red/yellow/frost blues stay truecolor: 256 twins too dim or collide.
+        assert!(matches!(theme.colors.error, Color::Rgb(191, 97, 106)));
+        assert!(matches!(theme.colors.md_heading, Color::Rgb(235, 203, 139)));
+        assert!(matches!(theme.colors.md_link, Color::Rgb(129, 161, 193)));
+        assert!(matches!(theme.colors.md_code, Color::Rgb(136, 192, 208)));
     }
 }
