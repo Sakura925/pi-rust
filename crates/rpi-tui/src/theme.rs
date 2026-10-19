@@ -642,7 +642,12 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.border_muted = Color::Rgb(71, 82, 88); // bg3 #475258
             colors.selection = Color::Rgb(61, 72, 77); // bg2 #3d484d
             colors.cursor = Color::Rgb(127, 187, 179);
-            colors.thinking_text = Color::Rgb(173, 182, 173);
+            // Everforest grey1 — the palette's comment color. Thinking blocks
+            // are the TUI's annotations: italic + grey1 keeps them readable
+            // (3.84:1, on par with pi Dark) while the brightness gap to the
+            // default foreground (~208) makes the distinction obvious
+            // (gap 67 vs 30 with the previous muted tone).
+            colors.thinking_text = Color::Rgb(133, 146, 137); // grey1 #859289
 
             // Markdown
             colors.md_heading = Color::Rgb(219, 188, 127); // yellow
@@ -800,5 +805,8 @@ mod tests {
         assert!(matches!(theme.colors.md_code_block, Color::Rgb(211, 198, 170)));
         assert!(matches!(theme.colors.tool_error_bg, Color::Rgb(64, 54, 60)));
         assert!(matches!(theme.colors.custom_message_bg, Color::Rgb(74, 68, 78)));
+        // Thinking uses the official comment color grey1, distinctly dimmer
+        // than the muted slots (tool output / quotes).
+        assert!(matches!(theme.colors.thinking_text, Color::Rgb(133, 146, 137)));
     }
 }
