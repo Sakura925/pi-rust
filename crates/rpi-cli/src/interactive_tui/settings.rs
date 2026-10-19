@@ -398,6 +398,8 @@ pub(super) fn open_settings_theme_selector(
             .with_description("Matched to the tty7 Harbor dark palette"),
         SelectItem::new("nord", "Nord")
             .with_description("Matched to the tty7 Nord dark palette"),
+        SelectItem::new("everforest", "Everforest")
+            .with_description("Everforest Dark Medium (user-confirmed palette)"),
     ];
     let list = Arc::new(SelectList::new(items, 10));
 
@@ -413,6 +415,7 @@ pub(super) fn open_settings_theme_selector(
             "dark" => Some(ThemePreset::Dark),
             "harbor" => Some(ThemePreset::Harbor),
             "nord" => Some(ThemePreset::Nord),
+            "everforest" => Some(ThemePreset::Everforest),
             name => {
                 add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
                 close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);

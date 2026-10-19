@@ -48,8 +48,8 @@ pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
         accent.fg(&bold("Welcome to rpi!"))
     ));
     lines.push(format!(
-        " {} Pick a theme with /theme (dark/light/monochrome/harbor/nord).",
-        muted.fg("Pick a theme with /theme (dark/light/monochrome/harbor/nord).")
+        " {} Pick a theme with /theme (dark/light/monochrome/harbor/nord/everforest).",
+        muted.fg("Pick a theme with /theme (dark/light/monochrome/harbor/nord/everforest).")
     ));
     lines.push(format!(
         " {} Type /help for commands.",

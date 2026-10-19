@@ -121,7 +121,7 @@ pub struct ResolvedModel {
     pub has_provider_key: bool,
     /// Saved theme name from `~/.rpi/agent/settings.json`, if any. Best-effort:
     /// the TUI applies it at startup when it matches a known preset
-    /// (dark/light/monochrome/harbor/nord); otherwise ignored.
+    /// (dark/light/monochrome/harbor/nord/everforest); otherwise ignored.
     pub theme: Option<String>,
     /// Every authenticated provider runtime, with the selected provider first.
     /// The harness resolves a provider lazily by `model.provider`, so this lets

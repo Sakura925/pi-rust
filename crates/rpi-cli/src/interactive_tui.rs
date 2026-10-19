@@ -1174,6 +1174,7 @@ pub async fn interactive_tui(
         Some("dark") => Some(ThemePreset::Dark),
         Some("harbor") => Some(ThemePreset::Harbor),
         Some("nord") => Some(ThemePreset::Nord),
+        Some("everforest") => Some(ThemePreset::Everforest),
         _ => None,
     } {
         apply_theme_preset(preset);

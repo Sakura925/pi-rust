@@ -617,6 +617,69 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
                 ..Default::default()
             }
         }
+        ThemePreset::Everforest => {
+            // Everforest: matched to the user-confirmed Everforest Dark
+            // Medium preview (bg #2d353b, fg #d3c6aa, accent blue #7fbbb3,
+            // soft red/green/yellow accents), layered with official
+            // Everforest palette components — surface bg1 #343f44, selection
+            // bg2 #3d484d, border_muted bg3 #475258, custom panels bg_purple
+            // #4a444e, decoration lines grey0 #7a8478. Semantic colors stay
+            // truecolor Rgb (the reviewed preview values) so the rendered
+            // result matches the design byte for byte.
+            let mut colors = ThemeColors::default();
+            colors.text = Color::Default;
+            colors.muted = Color::Rgb(173, 182, 173); // #adb6ad
+            colors.dim = Color::Rgb(157, 169, 160); // #9da9a0 (grey2)
+            colors.accent = Color::Rgb(127, 187, 179); // #7fbbb3 (blue)
+            colors.error = Color::Rgb(230, 152, 152); // #e69898
+            colors.success = Color::Rgb(167, 192, 128); // #a7c080 (green)
+            colors.warning = Color::Rgb(219, 188, 127); // #dbbc7f (yellow)
+            colors.info = Color::Rgb(164, 196, 203); // #a4c4cb
+            colors.background = Color::Default;
+            colors.surface = Color::Rgb(52, 63, 68); // bg1 #343f44
+            colors.border = Color::Rgb(133, 150, 140); // #85968c (confirmed)
+            colors.border_accent = Color::Rgb(127, 187, 179);
+            colors.border_muted = Color::Rgb(71, 82, 88); // bg3 #475258
+            colors.selection = Color::Rgb(61, 72, 77); // bg2 #3d484d
+            colors.cursor = Color::Rgb(127, 187, 179);
+            colors.thinking_text = Color::Rgb(173, 182, 173);
+
+            // Markdown
+            colors.md_heading = Color::Rgb(219, 188, 127); // yellow
+            colors.md_link = Color::Rgb(127, 187, 179); // accent
+            colors.md_link_url = Color::Rgb(157, 169, 160); // dim
+            colors.md_code = Color::Rgb(127, 187, 179); // accent
+            colors.md_code_bg = Color::Rgb(48, 58, 64); // #303a40
+            colors.md_code_block = Color::Rgb(211, 198, 170); // #d3c6aa
+            colors.md_code_block_bg = Color::Rgb(48, 58, 64);
+            colors.md_code_block_border = Color::Rgb(122, 132, 120); // grey0 #7a8478
+            colors.md_quote = Color::Rgb(173, 182, 173); // muted
+            colors.md_quote_border = Color::Rgb(122, 132, 120); // grey0
+            colors.md_hr = Color::Rgb(122, 132, 120);
+            colors.md_list_bullet = Color::Rgb(127, 187, 179); // accent
+
+            // Tool blocks
+            colors.tool_pending_bg = Color::Rgb(48, 58, 64); // #303a40
+            colors.tool_success_bg = Color::Rgb(51, 62, 57); // #333e39
+            colors.tool_error_bg = Color::Rgb(64, 54, 60); // #40363c
+            colors.tool_title = Color::Default;
+            colors.tool_output = Color::Rgb(173, 182, 173); // muted
+            colors.bash_mode = Color::Rgb(167, 192, 128); // green
+
+            // Custom messages / skill invocation
+            colors.custom_message_bg = Color::Rgb(74, 68, 78); // bg_purple #4a444e
+            colors.custom_message_label = Color::Rgb(214, 153, 182); // #d699b6
+            colors.custom_message_text = Color::Default;
+
+            // Tool diffs
+            colors.tool_diff_added = Color::Rgb(167, 192, 128);
+            colors.tool_diff_removed = Color::Rgb(230, 152, 152);
+            colors.tool_diff_context = Color::Rgb(173, 182, 173);
+            Theme {
+                colors,
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -639,6 +702,10 @@ pub enum ThemePreset {
     /// (background nord0 #2e3440, accent nord8 #88c0d0, official palette
     /// layering: surfaces nord1, selection nord2, borders nord3/nord10).
     Nord,
+    /// Everforest — Everforest Dark Medium, matched to the user-confirmed
+    /// preview (bg #2d353b, fg #d3c6aa, accent #7fbbb3) with official
+    /// palette layering (surface bg1, selection bg2, custom bg_purple).
+    Everforest,
 }
 
 /// Global theme helper functions.
@@ -718,5 +785,20 @@ mod tests {
         assert!(matches!(theme.colors.md_heading, Color::Rgb(235, 203, 139)));
         assert!(matches!(theme.colors.md_link, Color::Rgb(129, 161, 193)));
         assert!(matches!(theme.colors.md_code, Color::Rgb(136, 192, 208)));
+    }
+
+    #[test]
+    fn test_everforest_preset() {
+        let manager = ThemeManager::new();
+        manager.apply_preset(ThemePreset::Everforest);
+        let theme = manager.get();
+        // User-confirmed preview values, all truecolor Rgb.
+        assert!(matches!(theme.colors.accent, Color::Rgb(127, 187, 179)));
+        assert!(matches!(theme.colors.error, Color::Rgb(230, 152, 152)));
+        assert!(matches!(theme.colors.success, Color::Rgb(167, 192, 128)));
+        assert!(matches!(theme.colors.surface, Color::Rgb(52, 63, 68)));
+        assert!(matches!(theme.colors.md_code_block, Color::Rgb(211, 198, 170)));
+        assert!(matches!(theme.colors.tool_error_bg, Color::Rgb(64, 54, 60)));
+        assert!(matches!(theme.colors.custom_message_bg, Color::Rgb(74, 68, 78)));
     }
 }
