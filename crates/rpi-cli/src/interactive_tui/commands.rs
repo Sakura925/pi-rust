@@ -333,10 +333,11 @@ impl SlashCommand for ThemeCommand {
                 "light" => ThemePreset::Light,
                 "monochrome" => ThemePreset::Monochrome,
                 "dark" => ThemePreset::Dark,
+                "harbor" => ThemePreset::Harbor,
                 _ => {
                     add_error_message(
                         &ctx.chat,
-                        &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."),
+                        &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome, harbor."),
                     );
                     ctx.tui.request_render(false);
                     return;

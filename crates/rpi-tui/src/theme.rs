@@ -487,6 +487,70 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
                 ..Default::default()
             }
         }
+        ThemePreset::Harbor => {
+            // Harbor: matched to the tty7 terminal's built-in "Harbor" dark
+            // preset (background #1d2022, foreground #e4eef5, accent steel
+            // blue #6c96b4, soft red/green/yellow/blue/cyan ANSI slots).
+            // Semantic colors approximate the Harbor hexes by their nearest
+            // ANSI-256 index (accent #6c96b4 ≈ 67, red #c76156 ≈ 167, green
+            // #57c78a ≈ 78, yellow #c8a35a ≈ 179) so 256-color terminals keep
+            // the same relationships; Harbor's cyan #57c7c3 and bright-cyan
+            // #4d9989 have no faithful 256 twin (the nearest index collides
+            // with the success green), so those stay truecolor Rgb.
+            let mut colors = ThemeColors::default();
+            colors.text = Color::Default;
+            colors.muted = Color::Ansi256(247); // cool gray ≈ desaturated Harbor fg #94a1a8
+            colors.dim = Color::Ansi256(242);
+            colors.accent = Color::Ansi256(67); // steel blue ≈ Harbor accent #6c96b4
+            colors.error = Color::Ansi256(167); // ≈ Harbor red #c76156
+            colors.success = Color::Ansi256(78); // ≈ Harbor green #57c78a
+            colors.warning = Color::Ansi256(179); // ≈ Harbor yellow #c8a35a
+            colors.info = Color::Rgb(87, 199, 195); // Harbor cyan #57c7c3
+            colors.background = Color::Default;
+            colors.surface = Color::Rgb(43, 46, 49); // userMessageBg, lifted over #1d2022
+            colors.border = Color::Ansi256(68); // ≈ Harbor blue #5785c7
+            colors.border_accent = Color::Rgb(87, 199, 195);
+            colors.border_muted = Color::Rgb(49, 54, 58);
+            colors.selection = Color::Rgb(51, 58, 63);
+            colors.cursor = Color::Rgb(87, 199, 195);
+            colors.thinking_text = Color::Ansi256(247);
+
+            // Markdown
+            colors.md_heading = Color::Ansi256(179); // Harbor yellow
+            colors.md_link = Color::Ansi256(68); // Harbor blue
+            colors.md_link_url = Color::Ansi256(242);
+            colors.md_code = Color::Rgb(77, 153, 137); // Harbor bright cyan #4d9989
+            colors.md_code_bg = Color::Rgb(41, 46, 50);
+            colors.md_code_block = Color::Rgb(213, 221, 226); // cool white
+            colors.md_code_block_bg = Color::Rgb(35, 40, 46);
+            colors.md_code_block_border = Color::Rgb(84, 94, 101);
+            colors.md_quote = Color::Ansi256(247);
+            colors.md_quote_border = Color::Ansi256(243);
+            colors.md_hr = Color::Ansi256(243);
+            colors.md_list_bullet = Color::Ansi256(67); // accent
+
+            // Tool blocks
+            colors.tool_pending_bg = Color::Rgb(36, 40, 43);
+            colors.tool_success_bg = Color::Rgb(35, 49, 44); // green-tinted
+            colors.tool_error_bg = Color::Rgb(46, 38, 39); // red-tinted
+            colors.tool_title = Color::Default;
+            colors.tool_output = Color::Ansi256(247);
+            colors.bash_mode = Color::Ansi256(78);
+
+            // Custom messages / skill invocation
+            colors.custom_message_bg = Color::Rgb(46, 37, 48); // magenta-tinted
+            colors.custom_message_label = Color::Rgb(199, 86, 169); // Harbor magenta #c756a9
+            colors.custom_message_text = Color::Default;
+
+            // Tool diffs
+            colors.tool_diff_added = Color::Ansi256(78);
+            colors.tool_diff_removed = Color::Ansi256(167);
+            colors.tool_diff_context = Color::Ansi256(247);
+            Theme {
+                colors,
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -502,6 +566,9 @@ pub enum ThemePreset {
     Dark,
     Light,
     Monochrome,
+    /// Harbor — matched to the tty7 terminal's built-in "Harbor" dark
+    /// preset (background #1d2022, accent steel blue #6c96b4).
+    Harbor,
 }
 
 /// Global theme helper functions.
@@ -549,5 +616,20 @@ mod tests {
         manager.apply_preset(ThemePreset::Dark);
         let theme = manager.get();
         assert!(matches!(theme.colors.accent, Color::Ansi256(108)));
+    }
+
+    #[test]
+    fn test_harbor_preset() {
+        let manager = ThemeManager::new();
+        manager.apply_preset(ThemePreset::Harbor);
+        let theme = manager.get();
+        // Core semantic slots approximate the tty7 Harbor palette.
+        assert!(matches!(theme.colors.accent, Color::Ansi256(67)));
+        assert!(matches!(theme.colors.error, Color::Ansi256(167)));
+        assert!(matches!(theme.colors.success, Color::Ansi256(78)));
+        assert!(matches!(theme.colors.md_heading, Color::Ansi256(179)));
+        // Harbor cyan has no faithful 256 twin and stays truecolor.
+        assert!(matches!(theme.colors.info, Color::Rgb(87, 199, 195)));
+        assert!(matches!(theme.colors.md_code, Color::Rgb(77, 153, 137)));
     }
 }
