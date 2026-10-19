@@ -235,3 +235,44 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 - **feat/render-viewport-drift**：其中 healed 清屏修复已被上游 e59a6bb 方案取代（合并点消失）；仅 resume() SIGTSTP 重锚定仍有价值——需从新 local_master 重开分支重放
 - **feat/delegate-visibility**：待 merge 新 main 后继续
 - 正在运行的老进程（旧 0.3.24，含 tty7 各会话）继续用旧 inode 写旧格式（可读）；新开会话即 0.5.0
+
+## 晋级 #5:2026-10-19 · tty7 配套主题三连(Harbor / Nord / Everforest)
+
+| 项 | 值 |
+|---|---|
+| 晋级 commit | `c67ef26`(feat/theme-harbor ff 链:3188d94 Harbor → 5d62709 Nord → c67ef26 Everforest) |
+| 版本 | rpi 0.5.0(版本号不变,同版本多构建——以本档案 SHA-256 区分) |
+| 产物 SHA-256 | `a3a877b387ba23e2a1b9137942de95796ecb9848c5a50201879bbb10ec713a0f` |
+| 构建参数 | `cargo build --release -p rpi-cli --locked`(2m28s,thin LTO + codegen-units=16) |
+| 内容 | 新增 3 个 tty7 配套深色主题 preset:Harbor(基于 tty7 内置 Harbor)、Nord(基于 tty7 内置 Nord)、Everforest(Dark Medium,用户确认色值+官方色板补齐);`/theme`、`/settings`、选择器、启动恢复全接线;已有主题不受影响 |
+
+### 验证记录(全部通过)
+
+| 关卡 | 结果 |
+|---|---|
+| 受影响测试 | rpi-tui 337+6+8 全绿(含 `test_harbor/nord/everforest_preset`);rpi-cli 573+ 全绿 |
+| `cargo test --workspace --locked` | **1934 passed / 0 failed**(75 套件;exit 0;唯一 panic 输出来自 `panicking_register_body_is_contained_and_skipped` 测试自身的预期 panic,该测试 ok) |
+| 死锁回归 | `dialog_key_routing_releases_slot_locks_before_widget_callbacks` 1 passed(无挂死,确认实际运行) |
+| Everforest 独立候选验证 | A: `/theme everforest` 切换立即生效 + settings.json 保存 ✓;B: 重启恢复(首屏零 Dark 残留,`38;5;108`=0)✓;C: 真实对话渲染——工具成功 bg `48;2;51;62;57`×20、失败 bg `48;2;64;54;60`×8、代码块 bg `48;2;48;58;64`×46、diff added `38;2;167;192;128`×17 / removed `38;2;230;152;152`×2、代码正文 `#d3c6aa` ✓;D: 旧 session 副本 `--export` ✓ |
+| ask_user smoke | 面板弹出(选项渲染)→ Enter 正常关闭 → 下一条消息正常送达有回复("收到")→ exit 0 ✓ |
+| 模型连通 | 验证 C 中真实模型调用+三步工具执行 ✓ |
+| 验证环境隔离 | `RPI_CODING_AGENT_DIR=/tmp/rpi-ef-verify/agent` + `--session-dir /tmp/rpi-ef-verify/sessions`(凭据/models 均副本),日用环境零污染 |
+| 安装入口检查 | local_master ✓ 工作树干净(stash 用户未提交改动后)✓ HEAD=c67ef26 ✓ |
+
+### 产物与安装
+
+- commit:local_master = `c67ef26`(由 71dc0b9 ff 快进,无 merge commit)
+- 构建:安装用 `cargo install --path crates/rpi-cli --locked`(SKILL.md 口径)
+- 产物 SHA-256:`a3a877b3…13a0f`(安装前后核对)
+- 安装:备份 → `rm` + `cp`(macOS 签名缓存纪律)→ `rpi 0.5.0` ✓
+- 用户计划:安装后将重启全部 session(旧 session 兼容负担解除)
+
+### 回退保险
+
+- 旧二进制备份:`~/.cargo/bin/rpi-0.5.0-71dc0b9-bak`
+- 版本红线:0.5.0 同版本号升级,格式无演进;若需回退,先按 SKILL.md 检查新 session 格式
+
+### 遗留事项
+
+- tty7 侧 Everforest 为文件主题(`~/.config/tty7/themes/everforest.yaml`),非内置
+- feat/render-viewport-drift 与 feat/delegate-visibility 仍待处理(沿 #4 遗留)
