@@ -276,3 +276,10 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 
 - tty7 侧 Everforest 为文件主题(`~/.config/tty7/themes/everforest.yaml`),非内置
 - feat/render-viewport-drift 与 feat/delegate-visibility 仍待处理(沿 #4 遗留)
+
+### 增量 2026-10-19(午后):Everforest thinking 区分度微调(7a5a16c)
+
+- 内容:Everforest preset `thinking_text` 从 muted 系 `#adb6ad` 改为官方注释色 grey1 `#859289`(用户反馈 thinking 与最终输出亮度差仅 ~30 区分不明显;新值对比度 3.84:1,与正文亮度差 67,叠加既有斜体)
+- 验证:rpi-tui 337+6+8 全绿(test_everforest_preset 增加 thinking_text 断言);`cargo test --workspace --locked` **1934 passed / 0 failed**(exit 0);死锁回归 `dialog_key_routing_*` 1 passed 无挂死;安装后旧 session 副本 `--export` ✓
+- 产物 SHA-256:`2830376a681cd3e0…`(cargo install 复构建,源码 7a5a16c)
+- 回退保险:旧二进制 `~/.cargo/bin/rpi-0.5.0-dba6829-bak`(b82614e1)
