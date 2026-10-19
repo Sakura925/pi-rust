@@ -283,3 +283,10 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 - 验证:rpi-tui 337+6+8 全绿(test_everforest_preset 增加 thinking_text 断言);`cargo test --workspace --locked` **1934 passed / 0 failed**(exit 0);死锁回归 `dialog_key_routing_*` 1 passed 无挂死;安装后旧 session 副本 `--export` ✓
 - 产物 SHA-256:`2830376a681cd3e0…`(cargo install 复构建,源码 7a5a16c)
 - 回退保险:旧二进制 `~/.cargo/bin/rpi-0.5.0-dba6829-bak`(b82614e1)
+
+### 增量 2026-10-19(晚):thinking 竖线包裹 + truecolor DIM 修复(02f3679)
+
+- 内容:thinking 渲染重构——左侧 │ 竖线(结构性区分)+ 无斜体(真斜体字形笔画细于中文,行内中英明暗斑驳)+ 色值 #97a49b(轨迹 grey1 3.84:1 → 8f9a92 4.28 → 97a49b 4.81);**line_diff truecolor off-by-one 修复**(旧代码要求第 6 个参数,`38;2;R;G;B` 恰 5 参数全走拆分路径,`2` 落入 Intensity 槽成 `[2m` DIM → 折行续行整体被暗淡——上游既有 bug,所有主题彩色折行受影响)
+- 验证:rpi-tui 338+6+8 全绿(新增 truecolor 回归测试);workspace **1935 passed / 0 failed**(exit 0);死锁回归 1 passed 无挂死;安装后旧 session 副本 `--export` ✓
+- 产物 SHA-256:`857f5c42…3c3`(cargo install 复构建,源码 02f3679)
+- 回退保险:旧二进制 `~/.cargo/bin/rpi-0.5.0-8cad397-bak`(2830376a)
