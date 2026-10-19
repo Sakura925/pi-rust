@@ -242,7 +242,7 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 |---|---|
 | 晋级 commit | `c67ef26`(feat/theme-harbor ff 链:3188d94 Harbor → 5d62709 Nord → c67ef26 Everforest) |
 | 版本 | rpi 0.5.0(版本号不变,同版本多构建——以本档案 SHA-256 区分) |
-| 产物 SHA-256 | `a3a877b387ba23e2a1b9137942de95796ecb9848c5a50201879bbb10ec713a0f` |
+| 产物 SHA-256 | 安装构建 `b82614e121f1625e541f3e86502e618bba1af6d155b325b42bd81b60b52e1f06`;候选验证构建 `a3a877b387ba23e2a1b9137942de95796ecb9848c5a50201879bbb10ec713a0f`(同源码 a005731、同 profile,非确定性构建差异) |
 | 构建参数 | `cargo build --release -p rpi-cli --locked`(2m28s,thin LTO + codegen-units=16) |
 | 内容 | 新增 3 个 tty7 配套深色主题 preset:Harbor(基于 tty7 内置 Harbor)、Nord(基于 tty7 内置 Nord)、Everforest(Dark Medium,用户确认色值+官方色板补齐);`/theme`、`/settings`、选择器、启动恢复全接线;已有主题不受影响 |
 
@@ -263,7 +263,7 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 
 - commit:local_master = `c67ef26`(由 71dc0b9 ff 快进,无 merge commit)
 - 构建:安装用 `cargo install --path crates/rpi-cli --locked`(SKILL.md 口径)
-- 产物 SHA-256:`a3a877b3…13a0f`(安装前后核对)
+- 产物 SHA-256:安装后 `~/.cargo/bin/rpi` = `b82614e1…e1f06`(与 `target/release/rpi` 核对一致);候选验证构建为 `a3a877b3…13a0f`(cargo install 复构建后哈希不同,同源码同 profile,功能等价;安装后 smoke:--version、旧 session 副本 --export 均通过)
 - 安装:备份 → `rm` + `cp`(macOS 签名缓存纪律)→ `rpi 0.5.0` ✓
 - 用户计划:安装后将重启全部 session(旧 session 兼容负担解除)
 
