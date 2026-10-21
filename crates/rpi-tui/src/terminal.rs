@@ -82,12 +82,22 @@ pub fn synchronized_output_supported_for(term_program: Option<&str>, wt_session:
         return true;
     }
     match term_program {
-        // Known CSI 2026 implementors.
-        Some("ghostty" | "iTerm.app" | "WezTerm" | "kitty" | "foot" | "contour" | "vscode") => true,
-        // Confirmed non-implementors. tty7's VT core is alacritty_terminal
-        // (its TermMode has no SYNCHRONIZED_OUTPUT bit), and neither Apple
-        // Terminal nor Alacritty shipped the mode.
-        Some("tty7" | "Apple_Terminal" | "Alacritty") => false,
+        // Known CSI 2026 implementors. Alacritty ships it since 0.13.0
+        // (official changelog: "synchronized updates" switched to CSI 2026);
+        // blacklisting it would needlessly throttle a modern Alacritty to the
+        // fallback cadence.
+        Some(
+            "ghostty" | "iTerm.app" | "WezTerm" | "kitty" | "foot" | "contour" | "vscode"
+            | "Alacritty",
+        ) => true,
+        // Confirmed non-implementors, by observed behaviour (the rebuild
+        // clear-then-rewrite window visibly flickering on a real rpi session,
+        // and the fallback build calming it — 2026-10-21 tty7 A/B test).
+        // tty7's VT core is vendored from alacritty_terminal, but the crate's
+        // TermMode bit flags alone prove nothing about host behaviour; the
+        // entry stands on the A/B evidence. Apple Terminal never shipped the
+        // mode.
+        Some("tty7" | "Apple_Terminal") => false,
         // Unknown: keep the fast cadence; the flicker workaround is opt-in
         // only for terminals we have verified.
         _ => true,
@@ -569,12 +579,22 @@ mod tests {
 
     #[test]
     fn confirmed_flicker_terminals_are_blacklisted() {
-        for program in ["tty7", "Apple_Terminal", "Alacritty"] {
+        for program in ["tty7", "Apple_Terminal"] {
             assert!(
                 !synchronized_output_supported_for(Some(program), false),
                 "{program} should get the fallback cadence"
             );
         }
+    }
+
+    #[test]
+    fn alacritty_ships_synchronized_output_since_0_13() {
+        // codex 审查修正：Alacritty 0.13.0+ 官方支持 CSI 2026，不能误降到
+        // 15fps（降帧只是闪屏兑底，不是普遍优化）。
+        assert!(
+            synchronized_output_supported_for(Some("Alacritty"), false),
+            "Alacritty keeps the fast cadence (CSI 2026 since 0.13.0)"
+        );
     }
 
     #[test]

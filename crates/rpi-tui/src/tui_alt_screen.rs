@@ -727,6 +727,7 @@ impl TuiAltScreen {
         &self,
         terminal: &dyn Terminal,
         lines: &[String],
+        width: usize,
         clear_scrollback: bool,
     ) {
         terminal.write("\x1b[?2026h");
@@ -742,12 +743,28 @@ impl TuiAltScreen {
                 rebuilt.push_str("\r\n");
             }
             rebuilt.push_str(line);
-            // EL: the new row can be shorter than the old one.
-            rebuilt.push_str("\x1b[K");
+            // EL0 erases *including* the cursor cell and cancels pending wrap
+            // (Ghostty/xterm semantics), so a full-width row would lose its
+            // last character. A full-width row cannot have a longer leftover
+            // anyway — only shorter rows need the tail erase.
+            if visible_width(line) < width {
+                rebuilt.push_str("\x1b[K");
+            }
         }
         terminal.write(&rebuilt);
-        // ED0: wipe whatever a shorter new document leaves below the cursor.
-        terminal.write("\x1b[J");
+        // ED0 likewise starts at the cursor cell. After a full-width last row
+        // the cursor sits on that row's last column (pending wrap), so an ED0
+        // here would erase the row's final character. Skip it in that case and
+        // leave any below-document residue to the next non-full-width frame —
+        // a full-width last row with a document shorter than the viewport is
+        // rare, and the alternative (advance the cursor first) scrolls.
+        let last_row_shorter = lines
+            .last()
+            .map(|line| visible_width(line) < width)
+            .unwrap_or(false);
+        if last_row_shorter {
+            terminal.write("\x1b[J");
+        }
         terminal.write("\x1b[?2026l");
     }
 
@@ -813,11 +830,19 @@ impl TuiAltScreen {
             || (previous_height != 0 && previous_height != height)
             || changed_in_scrollback
         {
-            self.write_main_screen_rebuild(&**terminal, &lines, true);
+            self.write_main_screen_rebuild(&**terminal, &lines, width, true);
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else if previous.is_empty() {
-            self.write_main_screen_rebuild(&**terminal, &lines, false);
+            // First frame: the baseline behaviour appends from wherever the
+            // shell cursor sits, leaving the user's visible output on screen
+            // (only the saved scrollback is preserved by *not* emitting ED3).
+            // Homing to the top would paint over that visible output, so keep
+            // the original append path — full-width-row EL/ED0 hazards do not
+            // apply here because nothing is erased.
+            terminal.write("\x1b[?2026h");
+            terminal.write(&lines.join("\r\n"));
+            terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
@@ -1097,11 +1122,16 @@ impl TuiAltScreen {
                     buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
                     // On a full redraw there is no previous row to compare
                     // widths against, but an old longer row may still be on
-                    // screen (no leading clear), so always erase the tail.
+                    // screen (no leading clear), so erase the tail. EL0
+                    // includes the cursor cell (and cancels pending wrap),
+                    // so a full-width row must skip it — its last character
+                    // sits exactly on the cursor cell — and cannot have a
+                    // longer leftover anyway.
+                    let row_full_width = visible_width(line) >= width;
                     let old_row_shorter = !full_redraw
                         && row < previous.len()
                         && visible_width(line) >= visible_width(&previous[row]);
-                    if !old_row_shorter {
+                    if !old_row_shorter && !row_full_width {
                         buffer.push_str("\x1b[K");
                     }
                 }
@@ -2236,10 +2266,11 @@ mod tests {
         tui.stop(TuiStopOptions::default());
     }
 
-    /// First frame on the main screen keeps the user's scrollback (no ED3) but
-    /// still paints over the old screen instead of blanking it.
+    /// First frame on the main screen appends from the shell cursor, exactly
+    /// as the baseline did (codex P2): the user's visible shell output stays
+    /// on screen and the saved scrollback is untouched.
     #[test]
-    fn main_screen_first_frame_keeps_scrollback_and_overwrites() {
+    fn main_screen_first_frame_appends_from_the_shell_cursor() {
         let output = Arc::new(Mutex::new(String::new()));
         let tui = TuiAltScreen::new(
             Box::new(RecordingTerminal {
@@ -2263,7 +2294,14 @@ mod tests {
             !rendered.contains("\x1b[3J"),
             "first frame keeps the user's shell scrollback"
         );
-        assert!(rendered.contains("\x1b[K"), "row tails are still erased");
+        assert!(
+            !rendered.contains("\x1b[H"),
+            "first frame must not home over the shell's visible output"
+        );
+        assert!(
+            !rendered.contains("\x1b[K"),
+            "first frame appends without erasing (baseline behaviour)"
+        );
         tui.stop(TuiStopOptions::default());
     }
 

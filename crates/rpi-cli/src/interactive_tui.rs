@@ -1712,11 +1712,15 @@ pub async fn interactive_tui(
     // `MessageUpdate` per delta would otherwise force a full transcript
     // re-render + full-viewport terminal write per token, which is what made
     // long output saturate the terminal (and its GPU compositor). Immediate
-    // renders (selectors, the first frame, `render_now(..)`) are unaffected.
+    // renders (selectors, the first frame, `render_now(..)`) bypass the
+    // throttle; ordinary parked repaints — including the one a keystroke
+    // requests — wait out the window, so the worst-case input-echo delay on
+    // the fallback cadence is one interval (~66 ms).
     //
     // Terminals that ignore the CSI 2026 wrapper expose every full rebuild's
-    // clear-then-rewrite window as flicker (tty7, Apple Terminal, Alacritty);
-    // slowing the cadence trades smoothness for a calmer screen there.
+    // clear-then-rewrite window as flicker (tty7, Apple Terminal — by observed
+    // behaviour; Alacritty 0.13.0+ implements the mode); slowing the cadence
+    // trades smoothness for a calmer screen there.
     if !rpi_tui::terminal::supports_synchronized_output() {
         tui.set_render_interval_ms(rpi_tui::tui_alt_screen::FALLBACK_RENDER_INTERVAL_MS);
     }

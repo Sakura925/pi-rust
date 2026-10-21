@@ -247,10 +247,14 @@ impl VirtualTerminal {
                                             // ED0: from the cursor to the end of the
                                             // screen. The trailing wipe a main-screen
                                             // in-place rebuild emits instead of a
-                                            // leading 2J.
+                                            // leading 2J. A cursor past the right
+                                            // edge (after a full-width row, i.e.
+                                            // pending wrap) erases from the last
+                                            // column — the physical cursor cell.
                                             let index = st.viewport_top + st.cursor_row;
                                             self.ensure_row(&mut st, index);
-                                            for c in st.cursor_col..st.columns {
+                                            let start = st.cursor_col.min(st.columns - 1);
+                                            for c in start..st.columns {
                                                 st.document[index][c] = ' ';
                                                 st.italics[index][c] = false;
                                             }
@@ -275,10 +279,13 @@ impl VirtualTerminal {
                                     let mut st = self.state.lock().unwrap();
                                     let index = st.viewport_top + st.cursor_row;
                                     self.ensure_row(&mut st, index);
+                                    // EL0 starts at the cursor cell *inclusive*; a
+                                    // cursor past the right edge (pending wrap after
+                                    // a full-width row) erases from the last column.
                                     let start = if nums.first() == Some(&2) {
                                         0
                                     } else {
-                                        st.cursor_col
+                                        st.cursor_col.min(st.columns - 1)
                                     };
                                     for c in start..st.columns {
                                         st.document[index][c] = ' ';
@@ -638,5 +645,111 @@ fn long_transcript_stream_rewrite_keeps_dock_visible() {
     assert!(
         visible.last().unwrap().contains("FOOTER-STATUS"),
         "the dock must remain pinned across repeated streamed rewrites: {visible:?}"
+    );
+}
+
+// ---- codex 审查回归探针（2026-10-21，51a4db0 follow-up）----
+
+impl VirtualTerminal {
+    /// Test seam: change the grid size, as a real terminal resize does.
+    fn resize(&self, columns: usize, rows: usize) {
+        let mut st = self.state.lock().unwrap();
+        st.columns = columns;
+        st.rows = rows;
+    }
+}
+
+/// codex P1 回归：EL0 从光标格起擦（含），满宽行写完光标停在末列，
+/// 无条件行尾 EL0 会吃掉末列字符——同步输出只能原子呈现这个错误。
+/// 重建路径的行尾 EL 已条件化（满宽行无残留可擦，跳过）；本探针模拟
+/// 终端按 Ghostty 语义处理 pending wrap（屏外光标按末列起擦），任何
+/// 回归（满宽行又发出 EL0）都会让 40 个 A 变成 39 个 A＋空格。
+#[test]
+fn full_width_row_survives_in_place_rebuild() {
+    let term = VirtualTerminal::new(40, 8);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let full_row = "A".repeat(40);
+    let lines = |rewrapped: bool| {
+        (0..60)
+            .map(|i| match i {
+                10 if rewrapped => "line 010 REWRAPPED".to_string(),
+                55 => full_row.clone(),
+                _ => format!("line {i:03}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let content = Arc::new(Text::new(&lines(false), 0, 0));
+    tui.set_layout_root(Some(content.clone()));
+    tui.start_readerless();
+    // 首帧已经必须保留满宽行（首帧走追加路径，无 EL，天然安全；这里同时
+    // 校验基线不回归）。
+    assert!(
+        term.visible().iter().any(|row| row.contains(&full_row)),
+        "first frame must keep all 40 A's: {:?}",
+        term.visible()
+    );
+
+    // 改 scrollback 固化区的行 → 覆盖式重建（write_main_screen_rebuild）。
+    content.set_text(&lines(true));
+    tui.request_render(false);
+    let screen = term.visible().join("\n");
+    assert!(
+        screen.contains(&full_row),
+        "in-place rebuild must not erase the full-width row's last cell: {screen:?}"
+    );
+}
+
+/// codex P2 回归：首帧从当前光标追加（基线行为），预置的 shell 可见
+/// 输出必须保留——Home 到屏幕顶覆盖会把用户自己的输出抹掉。
+#[test]
+fn first_frame_appends_after_shell_output() {
+    let term = VirtualTerminal::new(40, 8);
+    // 模拟 TUI 启动前 shell 已经打印了两行（以 \r\n 收尾，光标停在第
+    // 三行行首——rpi 的文档从这里开始追加）。
+    term.feed("shell line one\r\nshell line two\r\n");
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let content = Arc::new(Text::new("rpi first message", 0, 0));
+    tui.set_layout_root(Some(content));
+    tui.start_readerless();
+
+    let screen = term.visible().join("\n");
+    assert!(
+        screen.contains("shell line one") && screen.contains("shell line two"),
+        "first frame must leave the user's shell output on screen: {screen:?}"
+    );
+    assert!(
+        screen.contains("rpi first message"),
+        "first frame must append the document after the shell output: {screen:?}"
+    );
+}
+
+/// codex P1 回归（alt screen 路径）：full redraw 的行尾 EL 同样条件化，
+/// 满宽行不得被 EL0 吃掉末列。
+#[test]
+fn alt_full_redraw_keeps_full_width_rows_intact() {
+    let term = VirtualTerminal::new(40, 8);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    let full_row = "A".repeat(40);
+    let content = Arc::new(Text::new(&full_row, 0, 0));
+    tui.set_layout_root(Some(content.clone()));
+    tui.start_readerless();
+    assert!(
+        term.visible().iter().any(|row| row.contains(&full_row)),
+        "alt-screen frame must keep all 40 A's: {:?}",
+        term.visible()
+    );
+
+    // 视口高度变化触发 do_render 的 full_redraw（去前置 2J、逐行覆盖 +
+    // 行尾 EL 条件化后的路径）。
+    term.resize(40, 10);
+    content.set_text(&format!("{full_row}\r\nshort"));
+    tui.request_render(false);
+    let screen = term.visible().join("\n");
+    assert!(
+        screen.contains(&full_row),
+        "full redraw must not erase the full-width row's last cell: {screen:?}"
     );
 }
