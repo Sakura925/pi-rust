@@ -290,3 +290,45 @@ thinking_level_map 强类型化、模型 cost 定价、bash 面板 render_panel 
 - 验证:rpi-tui 338+6+8 全绿(新增 truecolor 回归测试);workspace **1935 passed / 0 failed**(exit 0);死锁回归 1 passed 无挂死;安装后旧 session 副本 `--export` ✓
 - 产物 SHA-256:`857f5c42…3c3`(cargo install 复构建,源码 02f3679)
 - 回退保险:旧二进制 `~/.cargo/bin/rpi-0.5.0-8cad397-bak`(2830376a)
+
+## 晋级 #6:2026-10-21 · sync-output fallback——无 CSI 2026 终端的闪屏兜底
+
+| 项 | 值 |
+|---|---|
+| 晋级 commit | `37a18a6`(feat/sync-output-fallback ff 链:51a4db0 初版 → ef01c6b codex 一审三修正 → 37a18a6 codex 复审残留修复) |
+| 版本 | rpi 0.5.0(同版本多构建,以 SHA-256 区分) |
+| 产物 SHA-256 | 安装构建 `05cbf5bd6cf36fb2…`(local_master 上 `--locked` 复构建);tty7 实测构建 `b659cef83d440547…`(feat 分支同源码同 profile,非确定性构建差异,功能等价——同 #5 现象) |
+| 构建参数 | `cargo build --release -p rpi-cli --locked`(1m21s,thin LTO + codegen-units=16) |
+| 内容 | 三处正交兜底:①主屏全量重建改覆盖式重绘(ED3 清固化 scrollback → home → 逐行覆盖+条件 EL → 尾部条件 ED0,消除整屏空白帧;首帧保留基线追加路径不覆盖 shell 输出);②终端能力探测(`synchronized_output_supported_for` 纯函数:白名单 ghostty/iTerm.app/WezTerm/kitty/foot/contour/vscode/Alacritty,黑名单 tty7/Apple_Terminal——行为实证,未知终端保守不降帧,`RPI_SYNC_OUTPUT=0/1` 强制覆盖);③降帧(仅黑名单终端 16ms→66ms,render_interval_ms 原子字段,调度线程每轮读;普通按键 parked 帧同样受 66ms 窗口,回显最坏延迟一个 interval) |
+
+### 根因背景(留档)
+
+rpi 每帧渲染包 `\x1b[?2026h/l`(CSI 2026 同步输出)且无条件发送;主屏重建原为前置 `\x1b[2J\x1b[3J` 清屏+整文档重写,清屏与重写之间的整屏空白窗口在不实现 CSI 2026 的终端上直接暴露为闪屏。对照链:ghostty(实现 2026)同 session 零闪 → tty7 旧构建闪 → feat 构建不闪(tty7 VT core 源自 alacritty_terminal,但 TermMode 位标志不能证明宿主行为,判定依据是 A/B 行为实证;Alacritty 本体 0.13.0+ 官方支持 2026 已移入白名单)。上游 v0.5.0..v0.7.1 无相关修复(已核对 release notes+commit log)。
+
+### 验证记录(全部通过)
+
+| 关卡 | 结果 |
+|---|---|
+| 受影响测试 | rpi-tui 346 lib+10 集成+8 全绿(新增 4 探针:满宽行重建/首帧追加/alt full_redraw/满宽末行清残留+探测单测 4 个);rpi-cli 586 全绿 |
+| `cargo test --workspace --locked` | **1947 passed / 0 failed**(74 套件) |
+| 死锁回归 | `dialog_key_routing_releases_slot_locks_before_widget_callbacks` 1 passed 无挂死 |
+| codex 独立审查 | 一审 3 项(满宽 EL0 擦末列/首帧覆盖 shell 输出/Alacritty 误判)→ ef01c6b 修正;复审 1 项残留(满宽末行残留不补清——「下一帧补清」假设被证伪)→ 37a18a6 修正(实化换行 CR+LF 再 ED0 当帧清尽+记账);模拟终端按 Ghostty 语义校正(EL0/ED0 含光标格+pending wrap 屏外光标按末列起擦) |
+| tty7 真机实测 | ①51a4db0 构建:恢复 33MB 长会话 01a15383(runloom)流式输出全程用户确认无闪烁(此前同终端同场景持续闪屏);②37a18a6 feat 构建(b659cef8):用户在之前闪烁的 session 重启测试确认通过 |
+| 旧 session 副本 `--export` | feat 构建与安装后二进制各验一次,均成功导出 2.1MB HTML |
+| 安装入口检查 | local_master ✓ ff 无 merge commit ✓ 工作树仅用户既有本地改动(AGENTS.md/Taskfile.yml,不参与构建) |
+| 安装与冒烟 | 备份 → `rm`+`cp`(macOS 签名缓存纪律)→ 安装后 SHA 与 target/release 核对一致 → `rpi 0.5.0` ✓ |
+
+### 已知遗留(如实)
+
+- **CPU 热点未治**:每帧仍全量重渲染 transcript(strip_ansi/str_width),实测流式期间 CPU 100%。闪屏(IO 层)已解决;渲染缓存跨帧复用是独立优化方向(方案已论证未实施)
+- 探测为静态名单,未做 DECRQM 动态探测(避免 stdin 竞争);名单外新终端需手工维护
+- 降帧对黑名单终端的输入回显引入最坏 ~66ms 延迟(parked 帧;immediate render 不受影响)
+
+### 回退保险
+
+- 旧二进制备份:`~/.cargo/bin/rpi-0.5.0-1df07b2-bak`(857f5c42,#5 增量 02f3679 构建)
+- 版本红线:0.5.0 同版本号升级,格式无演进;若需回退,先按 SKILL.md 检查新 session 格式
+
+### 推送记录
+
+- `origin/local_master` 推送成功:`1df07b2..37a18a6`(GitHub 网络本次正常,#4 遗留的补推已完成)
