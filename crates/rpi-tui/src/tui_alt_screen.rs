@@ -728,8 +728,9 @@ impl TuiAltScreen {
         terminal: &dyn Terminal,
         lines: &[String],
         width: usize,
+        height: usize,
         clear_scrollback: bool,
-    ) {
+    ) -> usize {
         terminal.write("\x1b[?2026h");
         if clear_scrollback {
             // The scrollback is not addressable by cursor movement, so stale
@@ -752,20 +753,30 @@ impl TuiAltScreen {
             }
         }
         terminal.write(&rebuilt);
-        // ED0 likewise starts at the cursor cell. After a full-width last row
-        // the cursor sits on that row's last column (pending wrap), so an ED0
-        // here would erase the row's final character. Skip it in that case and
-        // leave any below-document residue to the next non-full-width frame —
-        // a full-width last row with a document shorter than the viewport is
-        // rare, and the alternative (advance the cursor first) scrolls.
-        let last_row_shorter = lines
+        // Tail wipe. ED0 likewise starts at the cursor cell, so after a
+        // full-width last row (cursor pending-wrap on its last column) a bare
+        // ED0 would erase that row's final character. When the document is
+        // shorter than the viewport the last row sits above the bottom, so a
+        // CR+LF is safe there (it cancels pending wrap and moves one row
+        // down without scrolling) and the ED0 wipes the old rows below the
+        // shrunken document. When the document fills the viewport the
+        // cursor is already on the bottom row — no residue exists and a LF
+        // would scroll, so skip the wipe entirely.
+        let last_row_full = lines
             .last()
-            .map(|line| visible_width(line) < width)
+            .map(|line| visible_width(line) >= width)
             .unwrap_or(false);
-        if last_row_shorter {
+        let has_residual = lines.len() < height;
+        if has_residual {
+            if last_row_full {
+                terminal.write("\r\n\x1b[J");
+                terminal.write("\x1b[?2026l");
+                return lines.len();
+            }
             terminal.write("\x1b[J");
         }
         terminal.write("\x1b[?2026l");
+        lines.len().saturating_sub(1)
     }
 
     fn do_render_main_screen(&self) {
@@ -830,8 +841,8 @@ impl TuiAltScreen {
             || (previous_height != 0 && previous_height != height)
             || changed_in_scrollback
         {
-            self.write_main_screen_rebuild(&**terminal, &lines, width, true);
-            *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
+            *self.main_hardware_row.lock().unwrap() =
+                self.write_main_screen_rebuild(&**terminal, &lines, width, height, true);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else if previous.is_empty() {
             // First frame: the baseline behaviour appends from wherever the

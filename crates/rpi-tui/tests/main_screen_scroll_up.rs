@@ -753,3 +753,58 @@ fn alt_full_redraw_keeps_full_width_rows_intact() {
         "full redraw must not erase the full-width row's last cell: {screen:?}"
     );
 }
+
+/// codex 复审 P2 残留回归：文档缩到只剩一行满宽文本时，重建的尾部清理
+/// 不能因为「末行满宽跳过 ED0」而漏掉——下方旧行（53–59）会永久留在屏
+/// 幕上：内容不变时增量路径直接 return（first_changed 为 None），
+/// 「下一帧补清」的假设不成立。修复：文档短于视口时末行必在非底行，
+/// CR+LF 实化换行（取消 pending wrap，安全不滚屏）后再 ED0 一次清尽。
+#[test]
+fn full_width_last_row_clears_residual_rows() {
+    let term = VirtualTerminal::new(40, 8);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let full_row = "A".repeat(40);
+    let content = Arc::new(Text::new(
+        &(0..60)
+            .map(|i| format!("line {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        0,
+        0,
+    ));
+    tui.set_layout_root(Some(content.clone()));
+    tui.start_readerless();
+    // 首帧：60 行文档，视口显示 52–59 行。
+    assert!(
+        term.visible().iter().any(|row| row.contains("line 059")),
+        "precondition: the old tail rows are visible: {:?}",
+        term.visible()
+    );
+
+    // 文档缩成一行满宽文本 → 触发覆盖式重建（行数收缩命中重建分支）。
+    content.set_text(&full_row);
+    tui.request_render(false);
+
+    let visible = term.visible();
+    assert!(
+        visible.iter().any(|row| row.contains(&full_row)),
+        "the full-width row must be painted: {visible:?}"
+    );
+    assert!(
+        !visible.iter().any(|row| row.contains("line 05")),
+        "old rows below the shrunken document must be wiped: {visible:?}"
+    );
+
+    // 内容不变再触发一帧（早退路径）：残留不得复活。
+    tui.request_render(false);
+    let visible = term.visible();
+    assert!(
+        !visible.iter().any(|row| row.contains("line 05")),
+        "a no-change frame must not resurrect the residue: {visible:?}"
+    );
+    assert!(
+        visible.iter().any(|row| row.contains(&full_row)),
+        "the full-width row stays: {visible:?}"
+    );
+}
