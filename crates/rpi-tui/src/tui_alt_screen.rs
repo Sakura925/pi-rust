@@ -1211,6 +1211,24 @@ impl TuiAltScreen {
                 }
             }
 
+            // Trailing ED0 on a full redraw (fork, sync-output fallback):
+            // with no leading 2J, a viewport SHRINK (e.g. 12 → 8 rows) would
+            // leave the old rows below the new frame on screen. ED0 erases
+            // from the cursor to the end of the screen, covering exactly that
+            // residue. Skipped when the last row is full-width: the cursor
+            // then sits on its last column (pending wrap) and ED0 — which
+            // includes the cursor cell — would erase the row's final character;
+            // that residue is rare and the next non-full-width frame clears it.
+            if full_redraw {
+                let last_row_full = visible
+                    .last()
+                    .map(|line| visible_width(line) >= width)
+                    .unwrap_or(false);
+                if !last_row_full {
+                    buffer.push_str("\x1b[J");
+                }
+            }
+
             // Position the hardware cursor using the marker location captured
             // before internal markers were stripped from `visible`.
             if let Some((row, col)) = cursor {
@@ -1743,9 +1761,12 @@ mod tests {
         tui.ensure_size();
 
         let frame = output.lock().unwrap().clone();
+        // fork sync-output fallback: no leading 2J — the in-place rebuild
+        // repaints every row instead. First and last row of the NEW viewport
+        // both being addressed is the semantic equivalent of "whole screen".
         assert!(
-            frame.contains("\x1b[2J"),
-            "a resize must repaint the whole screen, got: {frame:?}"
+            frame.contains("\x1b[1;1H"),
+            "a resize must repaint the first row, got: {frame:?}"
         );
         assert!(
             frame.contains("\x1b[12;1H"),
@@ -1812,8 +1833,8 @@ mod tests {
 
         let frame = output.lock().unwrap().clone();
         assert!(
-            frame.contains("\x1b[2J"),
-            "a width change must repaint every row, got: {frame:?}"
+            frame.contains("\x1b[1;1H") && frame.contains("\x1b[8;1H"),
+            "a width change must repaint every row (in-place rebuild: first and last row addressed), got: {frame:?}"
         );
         assert_eq!(*tui.painted_size.lock().unwrap(), (52, 8));
     }
@@ -1837,8 +1858,8 @@ mod tests {
 
         let frame = output.lock().unwrap().clone();
         assert!(
-            frame.contains("\x1b[2J"),
-            "a resize notification must repaint every row, got: {frame:?}"
+            frame.contains("\x1b[1;1H") && frame.contains("\x1b[8;1H"),
+            "a resize notification must repaint every row (in-place rebuild: first and last row addressed), got: {frame:?}"
         );
     }
 
@@ -1865,7 +1886,10 @@ mod tests {
                 assert!(tui.flush_pending_render());
             }
             let frame = output.lock().unwrap().clone();
-            assert!(frame.contains("\x1b[2J"), "missing full repaint: {frame:?}");
+            assert!(
+                frame.contains("\x1b[1;1H") && frame.contains("\x1b[8;1H"),
+                "missing full repaint (in-place rebuild: first and last row addressed): {frame:?}"
+            );
             assert_eq!(tui.full_redraws(), redraws + 1);
 
             // Steady-state watchdog ticks must still leave the frame alone.
@@ -2544,12 +2568,9 @@ mod tests {
     /// blank frame that terminals without CSI 2026 support expose as flicker.
     #[test]
     fn main_screen_rebuild_repaints_in_place_without_blank_frame() {
-        let output = Arc::new(Mutex::new(String::new()));
-        let size = Arc::new(Mutex::new((40usize, 8usize)));
-        let terminal = ResizableTerminal {
-            output: output.clone(),
-            size: size.clone(),
-        };
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
         let tui = TuiAltScreen::new(Box::new(terminal), true, None);
         tui.set_main_screen_mode(true);
         let content = Arc::new(Text::new("stable", 0, 0));
@@ -2622,12 +2643,9 @@ mod tests {
     /// every row over the old frame instead of clearing first.
     #[test]
     fn alt_screen_full_redraw_skips_leading_clear() {
-        let output = Arc::new(Mutex::new(String::new()));
-        let size = Arc::new(Mutex::new((40usize, 8usize)));
-        let terminal = ResizableTerminal {
-            output: output.clone(),
-            size: size.clone(),
-        };
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
         let tui = TuiAltScreen::new(Box::new(terminal), true, None);
         let content = Arc::new(Text::new("before", 0, 0));
         tui.set_layout_root(Some(content.clone()));
@@ -2653,53 +2671,6 @@ mod tests {
         tui.stop(TuiStopOptions::default());
     }
 
-    struct ResizableTerminal {
-        output: Arc<Mutex<String>>,
-        size: Arc<Mutex<(usize, usize)>>,
-    }
-
-    impl Terminal for ResizableTerminal {
-        fn info(&self) -> TerminalInfo {
-            let (columns, rows) = *self.size.lock().unwrap();
-            TerminalInfo {
-                columns,
-                rows,
-                ..Default::default()
-            }
-        }
-
-        fn write(&self, data: &str) {
-            self.output.lock().unwrap().push_str(data);
-        }
-
-        fn hide_cursor(&self) {}
-        fn show_cursor(&self) {}
-        fn move_cursor(&self, _row: usize, _col: usize) {}
-        fn clear_screen(&self) {}
-        fn set_title(&self, _title: &str) {}
-        fn enable_mouse(&self) {}
-        fn disable_mouse(&self) {}
-        fn enter_raw_mode(&self) {
-            self.write("<raw-on>");
-        }
-        fn exit_raw_mode(&self) {
-            self.write("<raw-off>");
-        }
-        fn refresh_size(&self) {}
-        fn start(
-            &self,
-            _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
-            _on_resize: Box<dyn Fn() + Send + Sync>,
-        ) {
-            self.enter_raw_mode();
-        }
-        fn stop(&self) {
-            self.write("<stop>");
-        }
-        fn is_tty(&self) -> bool {
-            true
-        }
-        fn set_progress(&self, _active: bool) {}
-        fn flush(&self) {}
-    }
+    // `ResizableTerminal`（含 new/output/size 访问器）上游 v0.6.1 已内置，
+    // fork 的重复定义已删——两处闪屏测试改用上游构造器。
 }

@@ -4294,6 +4294,31 @@ impl AgentHarness {
                 // `Send`, and holding it across `append_message` would make the
                 // whole run future non-`Send`.
                 let budget_stop = run_budget.lock().unwrap().stop();
+                // A run whose final assistant turn asks for no more tools ended
+                // NATURALLY — the loop's exit condition, not a truncation.
+                // Upstream v0.7.0's side-question child sets `max_turns = 1` as
+                // exactly such a natural single-turn bound: its one completed
+                // answer turn records `TurnLimit`, and treating that as a
+                // truncation fires the handoff summary — an extra provider
+                // call that consumes the next scripted response and overwrites
+                // the real answer. Keep the stop only for a run cut short
+                // mid-work (the final turn still asks for tools).
+                let budget_stop = budget_stop.filter(|_| {
+                    let wants_more_tools = new_messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| match m {
+                            AgentMessage::Assistant(a) => Some(a.as_ref()),
+                            _ => None,
+                        })
+                        .map(|a| {
+                            a.content
+                                .iter()
+                                .any(|b| matches!(b, rpi_ai::types::Content::ToolCall(_)))
+                        })
+                        .unwrap_or(true);
+                    wants_more_tools
+                });
                 let mut handoff_agent_message: Option<AgentMessage> = None;
                 let mut handoff_entry_id: Option<String> = None;
                 if let Some(stop) = budget_stop {
