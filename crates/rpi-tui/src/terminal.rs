@@ -64,6 +64,49 @@ fn keyboard_protocol_enabled() -> bool {
     )
 }
 
+/// CSI 2026 (synchronized output) capability, from the terminal identity.
+///
+/// Every rpi repaint wraps its terminal writes in `?2026h`/`?2026l` so a
+/// compliant terminal presents the frame atomically — the clear-then-rewrite
+/// window of a full rebuild never becomes visible. Terminals that ignore the
+/// pair expose that window as flicker. Hosts feed this into
+/// [`crate::tui_alt_screen::TuiAltScreen::set_render_interval_ms`] to slow the
+/// repaint cadence on those terminals (see
+/// [`crate::tui_alt_screen::FALLBACK_RENDER_INTERVAL_MS`]).
+///
+/// `term_program` is `$TERM_PROGRAM`; `wt_session` is `$WT_SESSION` presence
+/// (Windows Terminal). Unknown terminals default to `true`: the slower
+/// cadence is a compromise only applied where flicker has been confirmed.
+pub fn synchronized_output_supported_for(term_program: Option<&str>, wt_session: bool) -> bool {
+    if wt_session {
+        return true;
+    }
+    match term_program {
+        // Known CSI 2026 implementors.
+        Some("ghostty" | "iTerm.app" | "WezTerm" | "kitty" | "foot" | "contour" | "vscode") => true,
+        // Confirmed non-implementors. tty7's VT core is alacritty_terminal
+        // (its TermMode has no SYNCHRONIZED_OUTPUT bit), and neither Apple
+        // Terminal nor Alacritty shipped the mode.
+        Some("tty7" | "Apple_Terminal" | "Alacritty") => false,
+        // Unknown: keep the fast cadence; the flicker workaround is opt-in
+        // only for terminals we have verified.
+        _ => true,
+    }
+}
+
+/// `RPI_SYNC_OUTPUT=0` forces the fallback cadence on (for testing on a
+/// synchronized terminal); `RPI_SYNC_OUTPUT=1` forces it off. Otherwise
+/// [`synchronized_output_supported_for`] decides from the environment.
+pub fn supports_synchronized_output() -> bool {
+    if let Some(value) = std::env::var_os("RPI_SYNC_OUTPUT") {
+        return value != "0";
+    }
+    synchronized_output_supported_for(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var_os("WT_SESSION").is_some(),
+    )
+}
+
 /// Errors that can occur during terminal operations.
 #[derive(Debug, Error)]
 pub enum TerminalError {
@@ -505,6 +548,50 @@ fn normalize_native_shift_enter(mut key: KeyEvent, shift_pressed: bool) -> KeyEv
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_synchronized_output_terminals_are_whitelisted() {
+        for program in [
+            "ghostty",
+            "iTerm.app",
+            "WezTerm",
+            "kitty",
+            "foot",
+            "contour",
+            "vscode",
+        ] {
+            assert!(
+                synchronized_output_supported_for(Some(program), false),
+                "{program} should keep the fast cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_flicker_terminals_are_blacklisted() {
+        for program in ["tty7", "Apple_Terminal", "Alacritty"] {
+            assert!(
+                !synchronized_output_supported_for(Some(program), false),
+                "{program} should get the fallback cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_terminal_and_unknown_terminals_stay_fast() {
+        assert!(
+            synchronized_output_supported_for(None, false),
+            "unknown TERM_PROGRAM keeps the fast cadence"
+        );
+        assert!(synchronized_output_supported_for(
+            Some("mysteryterm"),
+            false
+        ));
+        assert!(
+            synchronized_output_supported_for(Some("tty7"), true),
+            "WT_SESSION wins even under a conflicting TERM_PROGRAM"
+        );
+    }
 
     #[derive(Clone)]
     struct RecordedOutput(Arc<Mutex<Vec<u8>>>);

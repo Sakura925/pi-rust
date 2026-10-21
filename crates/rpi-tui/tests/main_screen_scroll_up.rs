@@ -223,22 +223,52 @@ impl VirtualTerminal {
                                     st.cursor_col = col.min(st.columns - 1);
                                 }
                                 b'J' => {
+                                    // An absent CSI parameter defaults to 0 (ED0),
+                                    // but the generic parser above fills empty
+                                    // params with 1 (the A/B/C default), so consult
+                                    // the raw params string first.
+                                    let mode = if params.is_empty() {
+                                        0
+                                    } else {
+                                        nums.first().copied().unwrap_or(0)
+                                    };
                                     let mut st = self.state.lock().unwrap();
-                                    if nums.first() == Some(&3) {
-                                        // Erase saved lines only; the live screen
-                                        // and cursor stay at their screen positions.
-                                        let top = st.viewport_top;
-                                        st.document.drain(..top);
-                                        st.italics.drain(..top);
-                                        st.viewport_top = 0;
-                                        continue;
-                                    }
-                                    // Clear screen (2J): blank the visible rows.
-                                    let top = st.viewport_top;
-                                    for row in top..top + st.rows {
-                                        self.ensure_row(&mut st, row);
-                                        st.document[row] = vec![' '; st.columns];
-                                        st.italics[row] = vec![false; st.columns];
+                                    match mode {
+                                        3 => {
+                                            // Erase saved lines only; the live screen
+                                            // and cursor stay at their screen positions.
+                                            let top = st.viewport_top;
+                                            st.document.drain(..top);
+                                            st.italics.drain(..top);
+                                            st.viewport_top = 0;
+                                            continue;
+                                        }
+                                        0 => {
+                                            // ED0: from the cursor to the end of the
+                                            // screen. The trailing wipe a main-screen
+                                            // in-place rebuild emits instead of a
+                                            // leading 2J.
+                                            let index = st.viewport_top + st.cursor_row;
+                                            self.ensure_row(&mut st, index);
+                                            for c in st.cursor_col..st.columns {
+                                                st.document[index][c] = ' ';
+                                                st.italics[index][c] = false;
+                                            }
+                                            for row in index + 1..st.viewport_top + st.rows {
+                                                self.ensure_row(&mut st, row);
+                                                st.document[row] = vec![' '; st.columns];
+                                                st.italics[row] = vec![false; st.columns];
+                                            }
+                                        }
+                                        _ => {
+                                            // Clear screen (2J): blank the visible rows.
+                                            let top = st.viewport_top;
+                                            for row in top..top + st.rows {
+                                                self.ensure_row(&mut st, row);
+                                                st.document[row] = vec![' '; st.columns];
+                                                st.italics[row] = vec![false; st.columns];
+                                            }
+                                        }
                                     }
                                 }
                                 b'K' => {

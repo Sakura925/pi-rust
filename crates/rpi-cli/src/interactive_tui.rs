@@ -1707,11 +1707,19 @@ pub async fn interactive_tui(
 
     // Turn on the native-pi frame throttle before the first frame: from here on
     // `request_render(false)` parks a frame and the scheduler thread paints at
-    // most one per `MIN_RENDER_INTERVAL_MS` (16 ms). A provider that streams one
+    // most one per the render interval (16 ms, or the 66 ms fallback on
+    // terminals without synchronized output). A provider that streams one
     // `MessageUpdate` per delta would otherwise force a full transcript
     // re-render + full-viewport terminal write per token, which is what made
     // long output saturate the terminal (and its GPU compositor). Immediate
     // renders (selectors, the first frame, `render_now(..)`) are unaffected.
+    //
+    // Terminals that ignore the CSI 2026 wrapper expose every full rebuild's
+    // clear-then-rewrite window as flicker (tty7, Apple Terminal, Alacritty);
+    // slowing the cadence trades smoothness for a calmer screen there.
+    if !rpi_tui::terminal::supports_synchronized_output() {
+        tui.set_render_interval_ms(rpi_tui::tui_alt_screen::FALLBACK_RENDER_INTERVAL_MS);
+    }
     tui.start_render_scheduler();
     tui.start_readerless();
 

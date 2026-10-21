@@ -81,6 +81,9 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
     tui.set_layout_root(Some(root));
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
+    if !rpi_tui::terminal::supports_synchronized_output() {
+        tui.set_render_interval_ms(rpi_tui::tui_alt_screen::FALLBACK_RENDER_INTERVAL_MS);
+    }
     tui.start_render_scheduler();
     tui.start_readerless();
 

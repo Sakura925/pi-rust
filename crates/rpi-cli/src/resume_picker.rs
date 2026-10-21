@@ -107,6 +107,9 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
     tui.set_layout_root(Some(root));
     // Short-lived selector, but the same native-pi frame throttle applies: its
     // keystroke bursts coalesce instead of repainting per keypress.
+    if !rpi_tui::terminal::supports_synchronized_output() {
+        tui.set_render_interval_ms(rpi_tui::tui_alt_screen::FALLBACK_RENDER_INTERVAL_MS);
+    }
     tui.start_render_scheduler();
     tui.start_readerless();
 

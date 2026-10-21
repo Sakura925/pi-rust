@@ -4,7 +4,7 @@
 //! transcript and fixed bottom dock, as described in `tui-plan.md`.
 
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -33,6 +33,14 @@ pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
 /// is what keeps long, fast output from saturating the terminal — and the
 /// GPU-backed compositor behind it.
 pub const MIN_RENDER_INTERVAL_MS: u64 = 16;
+
+/// Coalesced repaint interval for terminals without CSI 2026 (synchronized
+/// output) support. Every rpi frame is wrapped in `?2026h`/`?2026l`; a
+/// terminal that ignores the pair exposes the clear-then-rewrite window of a
+/// full rebuild as visible flicker. Slowing the repaint cadence to ~15 fps on
+/// those terminals trades smoothness for a calmer screen; synchronized-output
+/// terminals keep [`MIN_RENDER_INTERVAL_MS`].
+pub const FALLBACK_RENDER_INTERVAL_MS: u64 = 66;
 
 /// Merge an incoming frame request into one that is already parked.
 ///
@@ -165,6 +173,10 @@ pub struct TuiAltScreen {
     /// The scheduler thread, joined by [`TuiAltScreen::stop`] so a parked frame
     /// cannot repaint the terminal after shutdown.
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Current scheduler throttle window, read by the scheduler thread on
+    /// every wake so [`TuiAltScreen::set_render_interval_ms`] takes effect
+    /// without a restart. Defaults to [`MIN_RENDER_INTERVAL_MS`].
+    render_interval_ms: AtomicU64,
 }
 
 impl TuiAltScreen {
@@ -207,7 +219,25 @@ impl TuiAltScreen {
             scheduler: Arc::new(RenderScheduler::new()),
             scheduler_started: AtomicBool::new(false),
             scheduler_thread: Mutex::new(None),
+            render_interval_ms: AtomicU64::new(MIN_RENDER_INTERVAL_MS),
         }
+    }
+
+    /// Adjust the coalesced repaint interval (milliseconds, clamped to
+    /// at least [`MIN_RENDER_INTERVAL_MS`] so a bad value cannot disable the
+    /// throttle entirely). The scheduler thread picks the new window up on
+    /// its next wake; hosts call this before [`TuiAltScreen::start_render_scheduler`]
+    /// with [`FALLBACK_RENDER_INTERVAL_MS`] when the terminal lacks
+    /// synchronized-output support (see
+    /// [`crate::terminal::supports_synchronized_output`]).
+    pub fn set_render_interval_ms(&self, ms: u64) {
+        let clamped = ms.max(MIN_RENDER_INTERVAL_MS);
+        self.render_interval_ms.store(clamped, Ordering::Release);
+    }
+
+    /// Current scheduler throttle window in milliseconds (test/diagnostic).
+    pub fn render_interval_ms(&self) -> u64 {
+        self.render_interval_ms.load(Ordering::Acquire)
     }
 
     /// Start the coalescing render scheduler — the Rust port of upstream's
@@ -249,11 +279,12 @@ impl TuiAltScreen {
     }
 
     /// Scheduler thread body: sleep until a frame is owed, then paint at most one
-    /// frame per [`MIN_RENDER_INTERVAL_MS`]. Idle screens pay no wakeups at all —
-    /// the thread is parked on the condvar.
+    /// frame per the current interval (see
+    /// [`TuiAltScreen::set_render_interval_ms`]). Idle screens pay no wakeups at
+    /// all — the thread is parked on the condvar.
     fn run_render_scheduler(self: Arc<Self>) {
-        let interval = Duration::from_millis(MIN_RENDER_INTERVAL_MS);
         loop {
+            let interval = Duration::from_millis(self.render_interval_ms.load(Ordering::Acquire));
             // ---- Wait for a frame to be owed (or shutdown) ----
             {
                 let Ok(mut state) = self.scheduler.state.lock() else {
@@ -676,6 +707,50 @@ impl TuiAltScreen {
     /// Render the complete component tree into the main terminal buffer. This
     /// follows upstream's regular-mode strategy: append growth with CRLF so
     /// the terminal creates real scrollback, and rewrite only the changed tail.
+    /// Rewrite the whole main-screen document without a leading blank-out.
+    ///
+    /// The classic rebuild cleared with `\x1b[2J` first and then rewrote every
+    /// row, painting a fully blank frame in between. Terminals that ignore the
+    /// CSI 2026 synchronized-output wrapper (tty7, Apple Terminal, Alacritty)
+    /// expose that window as visible flicker. Rewriting over the old content
+    /// instead — home, overwrite each row, erase each line's leftover tail
+    /// with EL, then one ED0 for the viewport remainder — keeps every row
+    /// populated at all times, shrinking the artifact to a transient per-row
+    /// tear. Synchronized-output terminals are unaffected: the whole frame is
+    /// atomic there, so the ordering does not matter.
+    ///
+    /// `clear_scrollback` additionally emits ED3 for full rebuilds (size
+    /// change or a scrollback hit), mirroring the original rebuild semantics;
+    /// the first-frame path passes `false` so the user's own shell scrollback
+    /// is not wiped when the TUI starts.
+    fn write_main_screen_rebuild(
+        &self,
+        terminal: &dyn Terminal,
+        lines: &[String],
+        clear_scrollback: bool,
+    ) {
+        terminal.write("\x1b[?2026h");
+        if clear_scrollback {
+            // The scrollback is not addressable by cursor movement, so stale
+            // history rows must be dropped wholesale on a rebuild.
+            terminal.write("\x1b[3J");
+        }
+        terminal.write("\x1b[H");
+        let mut rebuilt = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                rebuilt.push_str("\r\n");
+            }
+            rebuilt.push_str(line);
+            // EL: the new row can be shorter than the old one.
+            rebuilt.push_str("\x1b[K");
+        }
+        terminal.write(&rebuilt);
+        // ED0: wipe whatever a shorter new document leaves below the cursor.
+        terminal.write("\x1b[J");
+        terminal.write("\x1b[?2026l");
+    }
+
     fn do_render_main_screen(&self) {
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
@@ -738,16 +813,11 @@ impl TuiAltScreen {
             || (previous_height != 0 && previous_height != height)
             || changed_in_scrollback
         {
-            terminal.write("\x1b[?2026h");
-            terminal.write("\x1b[2J\x1b[H\x1b[3J");
-            terminal.write(&lines.join("\r\n"));
-            terminal.write("\x1b[?2026l");
+            self.write_main_screen_rebuild(&**terminal, &lines, true);
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else if previous.is_empty() {
-            terminal.write("\x1b[?2026h");
-            terminal.write(&lines.join("\r\n"));
-            terminal.write("\x1b[?2026l");
+            self.write_main_screen_rebuild(&**terminal, &lines, false);
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
@@ -1001,7 +1071,10 @@ impl TuiAltScreen {
                 if let Ok(mut count) = self.full_redraw_count.lock() {
                     *count += 1;
                 }
-                buffer.push_str("\x1b[2J"); // Clear screen
+                // No leading `\x1b[2J`: blanking the screen before the rewrite
+                // paints a fully blank frame that terminals without CSI 2026
+                // support expose as flicker. Every row is rewritten below, so
+                // overwriting in place + per-row EL is enough.
             }
 
             // Begin synchronized output
@@ -1022,7 +1095,13 @@ impl TuiAltScreen {
                     buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
                 } else {
                     buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
-                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
+                    // On a full redraw there is no previous row to compare
+                    // widths against, but an old longer row may still be on
+                    // screen (no leading clear), so always erase the tail.
+                    let old_row_shorter = !full_redraw
+                        && row < previous.len()
+                        && visible_width(line) >= visible_width(&previous[row]);
+                    if !old_row_shorter {
                         buffer.push_str("\x1b[K");
                     }
                 }
@@ -1769,7 +1848,13 @@ mod tests {
         // （first_changed < viewport_top）时放弃增量渲染——已固化的历史行
         // 无法被光标移动或 CSI T 寻址（SD 只在活动屏内插空行），尾部增量
         // 重写只会把历史内容重复追加一遍（2026-10-18 runloom 长会话实证：
-        // 每条长回复在终端上重复两遍）。必须走清屏 + 全文档重建。
+        // 每条长回复在终端上重复两遍）。必须走全文档重建。
+        //
+        // 重建的落屏方式从「前置 \x1b[2J 清屏」改为覆盖式重绘（fork 的
+        // sync-output-fallback）：home 后逐行覆盖 + 行尾 EL + 尾部 ED0，
+        // ED3 清固化 scrollback。契约不变——重建分支仍整支文档重写；
+        // 无同步输出的终端（tty7/Apple_Terminal/Alacritty）上不再出现
+        // 整屏空白帧。
         let output = Arc::new(Mutex::new(String::new()));
         let terminal = RecordingTerminal {
             output: output.clone(),
@@ -1806,10 +1891,19 @@ mod tests {
         tui.do_render(false);
 
         let frame = output.lock().unwrap().clone();
-        // 清屏 + 全量重建（而非增量尾部重写）。
+        // 全文档重建（而非增量尾部重写）：ED3 只在重建分支发出，
+        // 且从 home 起覆盖重写全部行。
         assert!(
-            frame.contains("\x1b[2J"),
-            "must clear before rebuilding: {frame:?}"
+            !frame.contains("\x1b[2J"),
+            "rebuild must paint over the old rows, not blank first: {frame:?}"
+        );
+        assert!(
+            frame.contains("\x1b[3J"),
+            "scrollback hit must drop the fixed scrollback: {frame:?}"
+        );
+        assert!(
+            frame.contains("\x1b[H"),
+            "rebuild homes the cursor: {frame:?}"
         );
         assert!(frame.contains("line 0"));
         assert!(frame.contains("line 10 (re-wrapped)"));
@@ -2081,5 +2175,180 @@ mod tests {
             "200 requests in ~250 ms must coalesce into ~16 ms frames, painted {frames}"
         );
         tui.stop(TuiStopOptions::default());
+    }
+
+    #[test]
+    fn render_interval_is_clamped_and_runtime_adjustable() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            true,
+            None,
+        );
+        assert_eq!(tui.render_interval_ms(), MIN_RENDER_INTERVAL_MS);
+        // A bad value cannot disable the throttle: zero clamps to the floor.
+        tui.set_render_interval_ms(0);
+        assert_eq!(tui.render_interval_ms(), MIN_RENDER_INTERVAL_MS);
+        tui.set_render_interval_ms(FALLBACK_RENDER_INTERVAL_MS);
+        assert_eq!(tui.render_interval_ms(), FALLBACK_RENDER_INTERVAL_MS);
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// Resize-triggered full rebuilds must repaint the document row by row
+    /// instead of blanking the screen first: a leading `\x1b[2J` paints a fully
+    /// blank frame that terminals without CSI 2026 support expose as flicker.
+    #[test]
+    fn main_screen_rebuild_repaints_in_place_without_blank_frame() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let size = Arc::new(Mutex::new((40usize, 8usize)));
+        let terminal = ResizableTerminal {
+            output: output.clone(),
+            size: size.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        let content = Arc::new(Text::new("stable", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A size change forces the full-rebuild branch (ED3 included).
+        *size.lock().unwrap() = (40, 10);
+        content.set_text("resized");
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(
+            !rendered.contains("\x1b[2J"),
+            "rebuild must not blank the screen first"
+        );
+        assert!(rendered.contains("\x1b[?2026h"), "frame stays atomic-able");
+        assert!(
+            rendered.contains("\x1b[3J"),
+            "rebuild still clears scrollback"
+        );
+        assert!(rendered.contains("\x1b[H"), "repaint homes the cursor");
+        assert!(rendered.contains("resized"), "new content is painted");
+        assert!(rendered.contains("\x1b[K"), "row tails are erased");
+        assert!(rendered.contains("\x1b[J"), "viewport remainder is wiped");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// First frame on the main screen keeps the user's scrollback (no ED3) but
+    /// still paints over the old screen instead of blanking it.
+    #[test]
+    fn main_screen_first_frame_keeps_scrollback_and_overwrites() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            true,
+            None,
+        );
+        tui.set_main_screen_mode(true);
+        let content = Arc::new(Text::new("initial", 0, 0));
+        tui.set_layout_root(Some(content));
+        tui.start_readerless();
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(rendered.contains("initial"));
+        assert!(
+            !rendered.contains("\x1b[2J"),
+            "first frame must not blank the screen"
+        );
+        assert!(
+            !rendered.contains("\x1b[3J"),
+            "first frame keeps the user's shell scrollback"
+        );
+        assert!(rendered.contains("\x1b[K"), "row tails are still erased");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// Alt-screen full redraws (viewport height change) must likewise paint
+    /// every row over the old frame instead of clearing first.
+    #[test]
+    fn alt_screen_full_redraw_skips_leading_clear() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let size = Arc::new(Mutex::new((40usize, 8usize)));
+        let terminal = ResizableTerminal {
+            output: output.clone(),
+            size: size.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new("before", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // Viewport height change flips `full_redraw` on in `do_render`.
+        *size.lock().unwrap() = (40, 10);
+        content.set_text("after");
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(
+            !rendered.contains("\x1b[2J"),
+            "full redraw must not blank the viewport first"
+        );
+        assert!(rendered.contains("after"));
+        assert!(
+            rendered.contains("\x1b[K"),
+            "rows erase their leftover tails"
+        );
+        assert!(rendered.contains("\x1b[?2026h"));
+        tui.stop(TuiStopOptions::default());
+    }
+
+    struct ResizableTerminal {
+        output: Arc<Mutex<String>>,
+        size: Arc<Mutex<(usize, usize)>>,
+    }
+
+    impl Terminal for ResizableTerminal {
+        fn info(&self) -> TerminalInfo {
+            let (columns, rows) = *self.size.lock().unwrap();
+            TerminalInfo {
+                columns,
+                rows,
+                ..Default::default()
+            }
+        }
+
+        fn write(&self, data: &str) {
+            self.output.lock().unwrap().push_str(data);
+        }
+
+        fn hide_cursor(&self) {}
+        fn show_cursor(&self) {}
+        fn move_cursor(&self, _row: usize, _col: usize) {}
+        fn clear_screen(&self) {}
+        fn set_title(&self, _title: &str) {}
+        fn enable_mouse(&self) {}
+        fn disable_mouse(&self) {}
+        fn enter_raw_mode(&self) {
+            self.write("<raw-on>");
+        }
+        fn exit_raw_mode(&self) {
+            self.write("<raw-off>");
+        }
+        fn refresh_size(&self) {}
+        fn start(
+            &self,
+            _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+            _on_resize: Box<dyn Fn() + Send + Sync>,
+        ) {
+            self.enter_raw_mode();
+        }
+        fn stop(&self) {
+            self.write("<stop>");
+        }
+        fn is_tty(&self) -> bool {
+            true
+        }
+        fn set_progress(&self, _active: bool) {}
+        fn flush(&self) {}
     }
 }
