@@ -11,6 +11,74 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/bigfish1913/pi-rust/compare/v0.7.0...v0.7.1) - 2026-10-21
+
+### Fixed
+
+- *(cli)* reject web startup without its server extension ([#76](https://github.com/bigfish1913/pi-rust/pull/76))
+- keep snapshot benchmark features buildable independently
+
+### Other
+
+- remove redundant provider snapshot conversions
+- add offline provider pipeline allocation benchmark
+
+## [0.7.0](https://github.com/bigfish1913/pi-rust/compare/v0.6.3...v0.7.0) - 2026-10-21
+
+### Fixed
+
+- *(rpc)* publish native workspace and ACP protocol support ([#71](https://github.com/bigfish1913/pi-rust/pull/71))
+
+## [0.6.3](https://github.com/bigfish1913/pi-rust/compare/v0.6.2...v0.6.3) - 2026-10-20
+
+### Other
+
+- update README website links to rpi.bigfisharc.cn
+- *(sdk)* consolidate provider bridge into optional SDK feature
+
+## [0.6.2](https://github.com/bigfish1913/pi-rust/compare/v0.6.1...v0.6.2) - 2026-10-19
+
+### Fixed
+
+- *(tui)* restore iTerm2 queue editing and cross-provider model cycling
+
+## [0.6.1](https://github.com/bigfish1913/pi-rust/compare/v0.6.0...v0.6.1) - 2026-10-19
+
+### Fixed
+
+- *(tui)* repaint the frame when the terminal is resized
+- *(tui)* preserve legacy resize repaint behavior
+
+## [0.6.0](https://github.com/bigfish1913/pi-rust/compare/v0.5.1...v0.6.0) - 2026-10-18
+
+### Added
+
+- *(btw)* port native side chat onto main
+
+### Fixed
+
+- *(ai)* preserve Anthropic tool result image payloads
+- *(ai)* serialize content with a single type discriminator
+
+### Other
+
+- *(cli)* format side-question module declaration
+
+## [0.5.1](https://github.com/bigfish1913/pi-rust/compare/v0.5.0...v0.5.1) - 2026-10-18
+
+### Fixed
+
+- *(cli)* parse linked changelog headings without losing patch versions
+- *(cli)* gate PowerShell tool import to Windows
+- avoid deprecated atomic updates while preserving MSRV
+- *(tools)* remove unused Unix process extension import
+- *(ci)* enforce warning-free builds on pull requests
+- *(tui)* apply shared theme spacing to tool panels
+
+### Other
+
+- clarify Pi attribution and 0.5.0 extension capabilities [skip ci]
+
 ## [0.5.0](https://github.com/bigfish1913/pi-rust/compare/v0.4.1...v0.5.0) - 2026-10-17
 
 ### Added

@@ -53,6 +53,7 @@ mod thinking_peek;
 use thinking_peek::ThinkingPeek;
 mod turn_telemetry;
 use turn_telemetry::TurnTelemetryTracker;
+mod side_questions;
 
 #[cfg(test)]
 mod tests;
@@ -1555,7 +1556,12 @@ pub async fn interactive_tui(
         StackChild::Entry(StackEntry::new(dock).shrink(1)),
     ]);
 
-    tui.set_layout_root(Some(Arc::new(root)));
+    let side_ui = Arc::new(Mutex::new(side_questions::SideQuestionUi::new(
+        Arc::new(root),
+        editor.clone(),
+        matches!(args.tui_mode, crate::args::TuiMode::Regular),
+    )));
+    tui.set_layout_root(Some(side_ui.lock().unwrap().root()));
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
 
@@ -1792,6 +1798,10 @@ pub async fn interactive_tui(
     plugin_panels.regular_mode = matches!(args.tui_mode, crate::args::TuiMode::Regular);
     plugin_panels.sync(tui.as_ref(), &reload_context.ext_status);
     let scroll_tick = scroll_view.clone();
+    let side_tick = side_ui.clone();
+    let side_context = reload_context.clone();
+    let side_parent = harness.clone();
+    let side_keys = keybindings.clone();
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
@@ -1807,12 +1817,29 @@ pub async fn interactive_tui(
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;
-            // Key-thread watchdog: the key loop heartbeats once per iteration;
-            // a stall longer than the budget means the thread is wedged on a
-            // lock (the ask_user-freeze class of hang: input dead, dialogs
-            // dead, Ctrl+C dead). Dump diagnostics once so the next hang
-            // leaves evidence even when nobody is around to sample it.
+            // Key-thread watchdog (fork): the key loop heartbeats once per
+            // iteration; a stall longer than the budget means the thread is
+            // wedged on a lock (the ask_user-freeze class of hang: input dead,
+            // dialogs dead, Ctrl+C dead). Dump diagnostics once so the next
+            // hang leaves evidence even when nobody is around to sample it.
             check_key_thread_heartbeat(&state_tick);
+            // Size watchdog (upstream v0.6.1): re-read the window and repaint
+            // when it differs from what is on screen. A resize event is only
+            // a hint (on Windows its record can be delivered before the window
+            // rectangle moves), and a lost event would otherwise leave the
+            // fullscreen frame at the previous geometry for the rest of the
+            // session.
+            tui_tick.ensure_size();
+            let side_changed = side_tick.lock().unwrap().sync(
+                &tui_tick,
+                &side_context,
+                &side_parent,
+                side_keys.clone(),
+                side_questions::input_allowed(&state_tick),
+            );
+            if side_changed {
+                tui_tick.request_render(false);
+            }
             // Extension status (langfuse ✓ …, …) — cheap revision check, and the
             // only reason an idle session repaints its footer.
             let panels_changed = plugin_panels.sync(tui_tick.as_ref(), &state_tick.ext_status);
@@ -1869,6 +1896,7 @@ pub async fn interactive_tui(
     let tui_for_key = tui.clone();
     let editor_for_key = editor.clone();
     let scroll_for_key = scroll_view.clone();
+    let side_for_key = side_ui.clone();
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
     let model_catalog_for_key = model_catalog_arc.clone();
@@ -1954,16 +1982,25 @@ pub async fn interactive_tui(
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
-            // handle it, so refresh the cached terminal size here and force a
-            // full redraw so the constrained layout re-fits the new dimensions.
-            if let Event::Resize(_cols, _rows) = ev {
-                tui_for_key.refresh_size();
+            // handle it: force one full-screen repaint. The renderer re-reads the
+            // window size itself; the event's own columns/rows are not used (on
+            // Windows they carry the console buffer size, not the window).
+            if let Event::Resize(..) = ev {
+                tui_for_key.note_resize();
                 continue;
             }
             // Mouse wheel scrolls the transcript (pi supports wheel
             // scrolling). Previously every non-Key event was dropped, so a
             // wheel had zero effect
             if let Event::Mouse(m) = ev {
+                if side_questions::input_allowed(&state_for_key)
+                    && side_for_key
+                        .lock()
+                        .unwrap()
+                        .mouse(&m, &tui_for_key, &scroll_for_key)
+                {
+                    continue;
+                }
                 if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
                     *state_for_key.selection_start.lock().unwrap() = None;
                     *state_for_key.selection_end.lock().unwrap() = None;
@@ -2054,6 +2091,11 @@ pub async fn interactive_tui(
             }
             let Event::Key(key) = ev else {
                 if let Event::Paste(text) = ev {
+                    if side_questions::input_allowed(&state_for_key)
+                        && side_for_key.lock().unwrap().paste(&text, &tui_for_key)
+                    {
+                        continue;
+                    }
                     crate::key_trace::note(&format!(
                         "paste event ({} bytes, bracketed paste supported)",
                         text.len()
@@ -2099,11 +2141,36 @@ pub async fn interactive_tui(
                 }
                 continue;
             };
-            let key = rpi_tui::terminal::normalize_key_event(key);
+            let key = rpi_tui::terminal::normalize_key_event_with_protocol(
+                key,
+                tui_for_key.terminal().info().supports_kitty_keyboard,
+            );
             // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
             crate::key_trace::key(&key, "");
+            // Side input is independent of main-run abort/preparation and plugin
+            // shortcuts. Modal/approval dialogs still own the input slot first.
+            if side_questions::input_allowed(&state_for_key)
+                && side_for_key.lock().unwrap().focused()
+            {
+                if !should_dispatch_key(key.kind) {
+                    continue;
+                }
+                if keybinding_matches(&keybindings_for_key, &key, rpi_tui::keybindings::keys::EXIT)
+                    && side_for_key.lock().unwrap().empty_draft()
+                {
+                    if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
+                        let _ = tx_for_key.send(TuiMessage::Exit);
+                    } else {
+                        emergency_exit(&tui_for_key);
+                    }
+                    continue;
+                }
+                if side_for_key.lock().unwrap().key(key, &tui_for_key) {
+                    continue;
+                }
+            }
             // A key press during a voice-draft auto-send countdown cancels the
             // countdown — the user wants to edit, not send. The key still falls
             // through to the editor, so it doubles as their first correction.
@@ -2498,63 +2565,39 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2f. Ctrl+P: cycle to the next model in the catalog after the one
-            //     currently tracked in `current_model_id`, apply it live via
-            //     `lane.set_model` (takes effect on the next user message — the
-            //     in-flight run's config is already snapshotted), and update the
-            //     footer. `set_model` is async so it runs on a spawned task.
-            if keybinding_matches(
+            // Cycle the authenticated catalog, including other providers. Resolve
+            // the anchor from the live lane so duplicate model ids stay distinct.
+            let cycle_forward = keybinding_matches(
                 &keybindings_for_key,
                 &key,
                 rpi_tui::keybindings::keys::MODEL_CYCLE_FORWARD,
-            ) {
-                let current = state_for_key.current_model_id();
-                // Cycle within the `/scoped-models` set (settings.json) when
-                // configured; otherwise the full catalog, restricted to the
-                // current provider (the lane cannot route another provider).
-                let scope = scoped_catalog(
-                    &ctx_for_key
-                        .model_catalog
-                        .read()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &current,
-                );
-                let scope = same_provider_catalog(&scope, &current);
-                if let Some(next) = cycle_next_model(&scope, &current) {
-                    state_for_key.set_current_model(&next);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.set_model(next).await;
-                    });
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
-                continue;
-            }
-
-            // 2f-bis. Shift+Ctrl+P (Alt+P on Windows): cycle to the *previous*
-            //     model, the mirror of the Ctrl+P hotkey above.
-            if keybinding_matches(
+            );
+            let cycle_backward = keybinding_matches(
                 &keybindings_for_key,
                 &key,
                 rpi_tui::keybindings::keys::MODEL_CYCLE_BACKWARD,
-            ) {
-                let current = state_for_key.current_model_id();
-                let scope = scoped_catalog(
-                    &ctx_for_key
-                        .model_catalog
-                        .read()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &current,
-                );
-                let scope = same_provider_catalog(&scope, &current);
-                if let Some(prev) = cycle_prev_model(&scope, &current) {
-                    state_for_key.set_current_model(&prev);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.set_model(prev).await;
-                    });
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
+            );
+            if cycle_forward || cycle_backward {
+                let catalog = ctx_for_key
+                    .model_catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let lane = lane_for_key.clone();
+                let state = state_for_key.clone();
+                let tui = tui_for_key.clone();
+                tokio::spawn(async move {
+                    match cycle_model(&lane, &catalog, cycle_backward).await {
+                        Ok(Some(model)) => {
+                            report_model_selection(&lane, &state, &tui, model, false).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            add_error_message(&state.chat_container, &error);
+                            tui.request_render(false);
+                        }
+                    }
+                });
                 continue;
             }
 

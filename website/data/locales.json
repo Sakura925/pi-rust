@@ -524,10 +524,10 @@
       ],
       "releases": [
         {
-          "version": "0.4.1",
+          "version": "0.5.1",
           "status": "current",
-          "title": "Model pricing, terminal fixes and automatic releases",
-          "description": "Configure model rates and thinking levels, fix extension dialogs, code wrapping and file appends, and publish every install channel through a Release PR."
+          "title": "Consistent tool panel themes and warning-free builds",
+          "description": "Edit, read and write panels share themed insets and status backgrounds. Changelog version parsing is fixed, and Linux and Windows PR checks now reject compiler warnings."
         },
         {
           "version": "next",
