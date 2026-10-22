@@ -332,3 +332,58 @@ rpi 每帧渲染包 `\x1b[?2026h/l`(CSI 2026 同步输出)且无条件发送;主
 ### 推送记录
 
 - `origin/local_master` 推送成功:`1df07b2..37a18a6`(GitHub 网络本次正常,#4 遗留的补推已完成)
+
+## 晋级 #7:2026-10-21 · 上游同步 v0.5.0 → v0.7.1(57 提交)
+
+| 项 | 值 |
+|---|---|
+| 晋级 commit | `d2a3454`(feat/upstream-v0.7.1 链:da9b180 merge v0.7.1 → d2a3454 合并语义修复) |
+| 版本 | **rpi 0.7.1**(跨 2 个 minor:0.5.0→0.6.0→0.7.1) |
+| 产物 SHA-256 | 安装构建 `2fe06b3a1977c58a…`(local_master `--locked` 复构建);tty7 冒烟候选 `41f14cabbbcb6668…`(feat 分支同源码同 profile,非确定性构建差异,同 #5/#6 现象) |
+| 构建参数 | `cargo build --release -p rpi-cli --locked`(1m36s,thin LTO + codegen-units=16) |
+| 上游内容 | v0.6.1 resize 重绘修复(painted_size/resize_dirty/ensure_size 看门狗 + ?7l 重断言)、v0.6.2 iTerm2 队列编辑/provider 热切换、v0.6.3 SDK provider bridge 重构、v0.7.0 ACP/RPC 协议 + 原生 side chat(side_questions)、v0.7.1 provider perf |
+
+### 冲突处理(5 文件 + 2 处自动合并语义损坏)
+
+- tui_alt_screen.rs full_redraw:保留 fork 的「去前置 2J」防闪屏,吸收上游 v0.6.1 resize 修复(?7l DECAWM 重断言);**补尾部条件 ED0**(视口缩小时原 2J 顺手清掉的下缘残留);上游 4 个 resize 测试断言从 `contains("\x1b[2J")` 改为首尾行寻址(语义等价)
+- terminal.rs tests:fork 4 个探测测试与上游 iTerm 归一化测试并列
+- interactive_tui.rs:模块声明并列(thinking_peek/turn_telemetry + side_questions);render-tick 双看门狗并存(fork key-thread heartbeat + 上游 ensure_size/side chat sync)
+- session.rs:保留 fork 的 create_delegate_task_tool 导入
+- docs/README.md:上游「来源与致谢」+ fork 个人文档区并存
+- tool_execution.rs(自动合并语义损坏 ①):上游 v0.7.1 把渲染拆为 render(缓存包装)→render_panel(纯渲染),fork 的 delegate 分支进 render_panel 后残留旧缓存块(引用外层局部变量)已删——缓存由外层 render 统一写
+
+### 合并语义损坏 ②(根因留档,均为「编译干净但行为错误」)
+
+**budget 截断误判自然完成的 run**(side_questions 3 个测试失败根因):
+- 上游 v0.7.0 side chat 的 child 设 `max_turns=1` 作自然单轮上限;fork 的 RunBudget 把 max_turns 映射为截断线——第 1 轮即 TurnLimit,触发 budget_handoff_summary 额外 provider 调用,消耗响应队列并覆盖真实回答(探针实证:side question 拿到脚本第 2 个响应)
+- 修复:budget_stop 过滤「叶子无 ToolCall 的 run」(自然完成),handoff/notice 仅对真截断生效
+
+另:ResizableTerminal fork/上游重名去重(fork 版删除,测试改用上游 new()/output()/size())。
+
+### 验证记录(全部通过)
+
+| 关卡 | 结果 |
+|---|---|
+| `cargo test --workspace --locked` | **2018 passed / 0 failed**(77 套件;side_questions 18、上游 resize 4、harness budget e2e 全绿) |
+| 死锁回归 | `dialog_key_routing_` 1 passed 无挂死 |
+| 旧 session 副本 `--export` | feat 候选与安装后二进制各验一次,0.5.0 时代 86M runloom 会话成功导出 2.1MB HTML |
+| tty7 冒烟 | 0.7.1 候选 TUI 正常启动;模型连通("ok" 回复,TTFT 7.0s;fork 的 TPS 遥测正常) |
+| 安装入口检查 | local_master ✓ ff 无 merge commit ✓ 工作树仅用户既有本地改动(AGENTS.md/Taskfile.yml,不参与构建) |
+| 安装与冒烟 | 备份 → `rm`+`cp` → SHA 与 target/release 核对一致 → `rpi 0.7.1` ✓ |
+
+### 版本红线(本次跨 2 个 minor,必读)
+
+- **升级后禁止回退 0.5.0 日常使用**:0.6/0.7 的 session 格式有演进可能(0.7.0 side chat 等新机制),旧二进制 fail-closed
+- 旧二进制备份:`~/.cargo/bin/rpi-0.5.0-7cf6f87-bak`(05cbf5bd,晋级 #6 产物)——仅作应急,回退前先按 SKILL.md 检查新 session 格式
+- 正在运行的旧 0.5.0 进程(tty7 各会话)继续用旧 inode 写旧格式(可读);新开会话即 0.7.1
+
+### 推送记录
+
+- `origin/local_master`:`7cf6f87..d2a3454` ✓;`origin/feat/upstream-v0.7.1` 新分支 ✓
+- main 已快进至 v0.7.1(281dfdd,纯本地基座,永不推送)
+
+### 遗留事项
+
+- 升级后建议重启全部 tty7 会话(旧进程旧格式负担解除)
+- CPU 热点(每帧全量重渲染)沿 #6 遗留,渲染缓存跨帧复用仍是独立优化方向
+- 上游 issue(tty7 CSI 2026 + rpi 闪屏报告)待提交,证据链已备
